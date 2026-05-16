@@ -24,6 +24,7 @@
 #![allow(missing_docs)]
 pub mod layer;
 pub mod primitive;
+pub mod texture_cache;
 pub mod window;
 
 #[cfg(feature = "geometry")]
@@ -90,6 +91,9 @@ pub struct Renderer {
     #[cfg(any(feature = "svg", feature = "image"))]
     image_cache: std::cell::RefCell<image::Cache>,
 
+    texture_cache: texture_cache::Storage,
+    texture_cache_state: texture_cache::FrameState,
+
     staging_belt: wgpu::util::StagingBelt,
 }
 
@@ -110,6 +114,9 @@ impl Renderer {
 
             #[cfg(any(feature = "svg", feature = "image"))]
             image_cache: std::cell::RefCell::new(engine.create_image_cache()),
+
+            texture_cache: texture_cache::Storage::new(),
+            texture_cache_state: texture_cache::FrameState::new(),
 
             // TODO: Resize belt smartly (?)
             // It would be great if the `StagingBelt` API exposed methods
@@ -140,12 +147,17 @@ impl Renderer {
                     label: Some("iced_wgpu encoder"),
                 });
 
+        // Flush pending texture caches into their backing textures using the
+        // same encoder so the main pass can sample them.
+        self.flush_pending_caches(&mut encoder);
+
         self.prepare(&mut encoder, viewport);
         self.render(&mut encoder, target, clear_color, viewport);
 
         self.quad.trim();
         self.triangle.trim();
         self.text.trim();
+        self.texture_cache_state.trim();
 
         // TODO: Provide window id (?)
         self.engine.trim();
@@ -392,6 +404,49 @@ impl Renderer {
 
                 prepare_span.finish();
             }
+
+            if !layer.cached_textures.is_empty() {
+                // Allocate or reuse this layer's compositing state.
+                if self.texture_cache_state.layers.len()
+                    <= self.texture_cache_state.prepare_layer
+                {
+                    self.texture_cache_state
+                        .layers
+                        .push(texture_cache::LayerState::new());
+                }
+
+                // The pipeline is guaranteed to exist if any cache is registered,
+                // and `draw_cached_texture` would have rejected the call otherwise.
+                let pipeline = self
+                    .texture_cache
+                    .pipeline
+                    .as_ref()
+                    .expect("texture_cache pipeline must exist when drawing cached textures");
+
+                let layer_state = &mut self.texture_cache_state.layers
+                    [self.texture_cache_state.prepare_layer];
+
+                layer_state.ensure_capacity(
+                    &self.engine.device,
+                    pipeline,
+                    layer.cached_textures.len() as u32,
+                );
+
+                for (index, instance) in layer.cached_textures.iter().enumerate() {
+                    layer_state.write_instance(
+                        &mut self.staging_belt,
+                        encoder,
+                        &self.engine.device,
+                        pipeline,
+                        index as u32,
+                        instance,
+                        viewport.projection(),
+                        scale_factor,
+                    );
+                }
+
+                self.texture_cache_state.prepare_layer += 1;
+            }
         }
     }
 
@@ -438,6 +493,7 @@ impl Renderer {
         let mut quad_layer = 0;
         let mut mesh_layer = 0;
         let mut text_layer = 0;
+        let mut cached_texture_layer = 0;
 
         #[cfg(any(feature = "svg", feature = "image"))]
         let mut image_layer = 0;
@@ -624,6 +680,37 @@ impl Renderer {
                 );
                 render_span.finish();
             }
+
+            if !layer.cached_textures.is_empty() {
+                let pipeline = self
+                    .texture_cache
+                    .pipeline
+                    .as_ref()
+                    .expect("texture_cache pipeline must exist");
+
+                let layer_state =
+                    &self.texture_cache_state.layers[cached_texture_layer];
+
+                // Build (index, &texture_bind_group) pairs for instances whose
+                // backing entry is still present.
+                let bindings: Vec<(u32, &wgpu::BindGroup)> = layer
+                    .cached_textures
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, instance)| {
+                        self.texture_cache
+                            .entries
+                            .get(&instance.cache_id)
+                            .map(|entry| (idx as u32, &entry.texture_bind_group))
+                    })
+                    .collect();
+
+                if !bindings.is_empty() {
+                    layer_state.render(pipeline, &bindings, scissor_rect, &mut render_pass);
+                }
+
+                cached_texture_layer += 1;
+            }
         }
 
         let _ = ManuallyDrop::into_inner(render_pass);
@@ -662,6 +749,165 @@ impl Renderer {
     pub fn recall(&mut self) {
         self.staging_belt.recall();
     }
+
+    /// Allocates a fresh [`texture_cache::Entry`] (texture + bind group +
+    /// per-cache `State`s) and inserts it into the storage. Recreates the
+    /// texture if an entry with this id already exists but the physical
+    /// size has changed.
+    fn ensure_texture_cache_entry(
+        &mut self,
+        id: u64,
+        size: Size<u32>,
+        physical_size: Size<u32>,
+        scale_factor: f32,
+    ) {
+        // Lazily initialize the sampling pipeline.
+        if self.texture_cache.pipeline.is_none() {
+            self.texture_cache.pipeline = Some(texture_cache::Pipeline::new(
+                &self.engine.device,
+                self.engine.format,
+            ));
+        }
+        let pipeline = self
+            .texture_cache
+            .pipeline
+            .as_ref()
+            .expect("texture_cache pipeline initialized");
+
+        let needs_alloc = match self.texture_cache.entries.get(&id) {
+            Some(e) => e.physical_size != physical_size,
+            None => true,
+        };
+
+        if !needs_alloc {
+            if let Some(entry) = self.texture_cache.entries.get_mut(&id) {
+                entry.size = size;
+                entry.scale_factor = scale_factor;
+            }
+            return;
+        }
+
+        let texture = self.engine.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("iced_wgpu.texture_cache.texture"),
+            size: wgpu::Extent3d {
+                width: physical_size.width.max(1),
+                height: physical_size.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.engine.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let texture_bind_group =
+            self.engine
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("iced_wgpu.texture_cache.texture_bind_group"),
+                    layout: &pipeline.texture_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    }],
+                });
+
+        let entry = texture_cache::Entry {
+            texture,
+            view,
+            texture_bind_group,
+            size,
+            physical_size,
+            scale_factor,
+            quad: quad::State::new(),
+            triangle: triangle::State::new(
+                &self.engine.device,
+                &self.engine.triangle_pipeline,
+            ),
+            text: text::State::new(),
+            text_viewport: self
+                .engine
+                .text_pipeline
+                .create_viewport(&self.engine.device),
+            #[cfg(any(feature = "image", feature = "svg"))]
+            image: image::State::new(),
+        };
+
+        let _ = self.texture_cache.entries.insert(id, entry);
+    }
+
+    /// Renders all pending texture-cache recordings into their respective
+    /// backing textures. Must be called before the main `prepare`/`render`
+    /// pass and use the same `encoder` so cache textures are populated
+    /// before the main pass samples them.
+    fn flush_pending_caches(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        if self.texture_cache.pending.is_empty() {
+            return;
+        }
+
+        let pending: Vec<_> = self
+            .texture_cache
+            .pending
+            .drain()
+            .collect();
+
+        for (id, layers) in pending {
+            // Briefly take ownership of the entry to avoid a double mutable
+            // borrow of self.texture_cache.entries while calling self.prepare.
+            let Some(mut entry) = self.texture_cache.entries.remove(&id) else {
+                continue;
+            };
+
+            let cache_viewport = Viewport::with_physical_size(
+                entry.physical_size,
+                entry.scale_factor,
+            );
+
+            // Swap dedicated state with main renderer's per-frame state.
+            std::mem::swap(&mut self.quad, &mut entry.quad);
+            std::mem::swap(&mut self.triangle, &mut entry.triangle);
+            std::mem::swap(&mut self.text, &mut entry.text);
+            std::mem::swap(&mut self.text_viewport, &mut entry.text_viewport);
+            #[cfg(any(feature = "image", feature = "svg"))]
+            std::mem::swap(&mut self.image, &mut entry.image);
+
+            let saved_layers = std::mem::replace(&mut self.layers, layers);
+
+            self.prepare(encoder, &cache_viewport);
+            self.render(
+                encoder,
+                &entry.view,
+                Some(Color::TRANSPARENT),
+                &cache_viewport,
+            );
+
+            self.layers = saved_layers;
+
+            // Trim the cache's State counters before swapping them back so
+            // that subsequent re-records start from slot 0.
+            self.quad.trim();
+            self.triangle.trim();
+            self.text.trim();
+            #[cfg(any(feature = "image", feature = "svg"))]
+            self.image.trim();
+
+            // Swap back.
+            std::mem::swap(&mut self.quad, &mut entry.quad);
+            std::mem::swap(&mut self.triangle, &mut entry.triangle);
+            std::mem::swap(&mut self.text, &mut entry.text);
+            std::mem::swap(&mut self.text_viewport, &mut entry.text_viewport);
+            #[cfg(any(feature = "image", feature = "svg"))]
+            std::mem::swap(&mut self.image, &mut entry.image);
+
+            let _ = self.texture_cache.entries.insert(id, entry);
+        }
+    }
 }
 
 impl core::Renderer for Renderer {
@@ -688,20 +934,61 @@ impl core::Renderer for Renderer {
 
     fn start_recording_texture(
         &mut self,
-        _cache: &TextureCache,
-        _size: Size<u32>,
-        _scale_factor: f32,
+        cache: &TextureCache,
+        size: Size<u32>,
+        scale_factor: f32,
     ) -> bool {
-        // TODO: implement deferred texture recording
-        false
+        let id = cache.id().as_u64();
+        let invalidated = cache.take_invalidated();
+
+        let physical_size = Size::new(
+            ((size.width as f32) * scale_factor).round() as u32,
+            ((size.height as f32) * scale_factor).round() as u32,
+        );
+
+        let needs_redraw = invalidated
+            || match self.texture_cache.entries.get(&id) {
+                Some(e) => {
+                    e.size != size
+                        || e.physical_size != physical_size
+                        || (e.scale_factor - scale_factor).abs() > f32::EPSILON
+                }
+                None => true,
+            };
+
+        if !needs_redraw {
+            return false;
+        }
+
+        self.ensure_texture_cache_entry(id, size, physical_size, scale_factor);
+
+        let bounds = Rectangle::with_size(Size::new(size.width as f32, size.height as f32));
+        let mut new_stack = layer::Stack::new();
+        new_stack.reset(bounds);
+
+        let saved = std::mem::replace(&mut self.layers, new_stack);
+        self.texture_cache.recording_stack.push((id, saved));
+
+        true
     }
 
     fn end_recording_texture(&mut self) {
-        // TODO: implement deferred texture recording
+        let Some((id, saved)) = self.texture_cache.recording_stack.pop() else {
+            return;
+        };
+
+        let captured = std::mem::replace(&mut self.layers, saved);
+        let _ = self.texture_cache.pending.insert(id, captured);
     }
 
-    fn draw_cached_texture(&mut self, _cache: &TextureCache, _bounds: Rectangle) {
-        // TODO: implement cached texture sampling
+    fn draw_cached_texture(&mut self, cache: &TextureCache, bounds: Rectangle) {
+        let id = cache.id().as_u64();
+        if !self.texture_cache.entries.contains_key(&id) {
+            return;
+        }
+
+        let (layer, transformation) = self.layers.current_mut();
+        layer.draw_cached_texture(id, bounds, transformation);
     }
 
     fn allocate_image(
