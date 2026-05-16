@@ -9,6 +9,7 @@ use crate::image::{self, Image};
 use crate::primitive::{self, Primitive};
 use crate::quad::{self, Quad};
 use crate::text::{self, Text};
+use crate::texture_cache;
 use crate::triangle;
 
 pub type Stack = layer::Stack<Layer>;
@@ -21,6 +22,7 @@ pub struct Layer {
     pub primitives: primitive::Batch,
     pub images: image::Batch,
     pub text: text::Batch,
+    pub cached_textures: texture_cache::Batch,
     pending_meshes: Vec<Mesh>,
     pending_text: Vec<Text>,
 }
@@ -32,8 +34,21 @@ impl Layer {
             && self.primitives.is_empty()
             && self.images.is_empty()
             && self.text.is_empty()
+            && self.cached_textures.is_empty()
             && self.pending_meshes.is_empty()
             && self.pending_text.is_empty()
+    }
+
+    pub fn draw_cached_texture(
+        &mut self,
+        cache_id: u64,
+        bounds: Rectangle,
+        transformation: Transformation,
+    ) {
+        self.cached_textures.push(texture_cache::Instance {
+            cache_id,
+            bounds: bounds * transformation,
+        });
     }
 
     pub fn draw_quad(
@@ -299,6 +314,7 @@ impl graphics::Layer for Layer {
         self.primitives.clear();
         self.text.clear();
         self.images.clear();
+        self.cached_textures.clear();
         self.pending_meshes.clear();
         self.pending_text.clear();
     }
@@ -324,10 +340,18 @@ impl graphics::Layer for Layer {
             return 5;
         }
 
+        if !self.cached_textures.is_empty() {
+            return 6;
+        }
+
         usize::MAX
     }
 
     fn end(&self) -> usize {
+        if !self.cached_textures.is_empty() {
+            return 6;
+        }
+
         if !self.text.is_empty() {
             return 5;
         }
@@ -357,6 +381,7 @@ impl graphics::Layer for Layer {
         self.primitives.append(&mut layer.primitives);
         self.images.append(&mut layer.images);
         self.text.append(&mut layer.text);
+        self.cached_textures.append(&mut layer.cached_textures);
     }
 }
 
@@ -369,6 +394,7 @@ impl Default for Layer {
             primitives: primitive::Batch::default(),
             text: text::Batch::default(),
             images: image::Batch::default(),
+            cached_textures: texture_cache::Batch::default(),
             pending_meshes: Vec::new(),
             pending_text: Vec::new(),
         }
