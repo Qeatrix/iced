@@ -11,12 +11,20 @@ use std::sync::Arc;
 pub type Stack = layer::Stack<Layer>;
 
 #[derive(Debug, Clone)]
+pub struct CachedTexture {
+    pub cache_id: u64,
+    pub bounds: Rectangle,
+    pub transformation: Transformation,
+}
+
+#[derive(Debug, Clone)]
 pub struct Layer {
     pub bounds: Rectangle,
     pub quads: Vec<(Quad, Background)>,
     pub primitives: Vec<Item<Primitive>>,
     pub images: Vec<Image>,
     pub text: Vec<Item<Text>>,
+    pub cached_textures: Vec<CachedTexture>,
 }
 
 impl Layer {
@@ -28,6 +36,19 @@ impl Layer {
     ) {
         quad.bounds = quad.bounds * transformation;
         self.quads.push((quad, background));
+    }
+
+    pub fn draw_cached_texture(
+        &mut self,
+        cache_id: u64,
+        bounds: Rectangle,
+        transformation: Transformation,
+    ) {
+        self.cached_textures.push(CachedTexture {
+            cache_id,
+            bounds: bounds * transformation,
+            transformation: Transformation::IDENTITY,
+        });
     }
 
     pub fn draw_paragraph(
@@ -308,6 +329,7 @@ impl Default for Layer {
             primitives: Vec::new(),
             text: Vec::new(),
             images: Vec::new(),
+            cached_textures: Vec::new(),
         }
     }
 }
@@ -337,6 +359,7 @@ impl graphics::Layer for Layer {
         self.primitives.clear();
         self.text.clear();
         self.images.clear();
+        self.cached_textures.clear();
     }
 
     fn start(&self) -> usize {
@@ -356,10 +379,18 @@ impl graphics::Layer for Layer {
             return 4;
         }
 
+        if !self.cached_textures.is_empty() {
+            return 5;
+        }
+
         usize::MAX
     }
 
     fn end(&self) -> usize {
+        if !self.cached_textures.is_empty() {
+            return 5;
+        }
+
         if !self.text.is_empty() {
             return 4;
         }
@@ -384,6 +415,7 @@ impl graphics::Layer for Layer {
         self.primitives.append(&mut layer.primitives);
         self.text.append(&mut layer.text);
         self.images.append(&mut layer.images);
+        self.cached_textures.append(&mut layer.cached_textures);
     }
 }
 
