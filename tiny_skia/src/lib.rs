@@ -6,6 +6,7 @@ mod engine;
 mod layer;
 mod primitive;
 mod text;
+mod texture_cache;
 
 #[cfg(feature = "image")]
 mod raster;
@@ -39,11 +40,21 @@ use crate::graphics::text::{Editor, Paragraph};
 ///
 /// [`tiny-skia`]: https://github.com/RazrFalcon/tiny-skia
 /// [`iced`]: https://github.com/iced-rs/iced
-#[derive(Debug)]
 pub struct Renderer {
     settings: renderer::Settings,
     layers: layer::Stack,
     engine: Engine, // TODO: Shared engine
+    texture_cache: texture_cache::Storage,
+}
+
+impl std::fmt::Debug for Renderer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Renderer")
+            .field("settings", &self.settings)
+            .field("layers", &self.layers)
+            .field("engine", &self.engine)
+            .finish()
+    }
 }
 
 impl Renderer {
@@ -52,6 +63,7 @@ impl Renderer {
             settings,
             layers: layer::Stack::new(),
             engine: Engine::new(),
+            texture_cache: texture_cache::Storage::new(),
         }
     }
 
@@ -69,8 +81,76 @@ impl Renderer {
         background_color: Color,
     ) {
         let scale_factor = viewport.scale_factor();
-        self.layers.flush();
 
+        // 1. Flush pending texture caches into their backing pixmaps.
+        if !self.texture_cache.pending.is_empty() {
+            let pending: Vec<(u64, layer::Stack)> =
+                self.texture_cache.pending.drain().collect();
+
+            for (id, mut layers) in pending {
+                let Some(mut entry) = self.texture_cache.entries.remove(&id) else {
+                    continue;
+                };
+
+                layers.flush();
+
+                // Clear the cache pixmap, then render the recorded layers
+                // into it with a fresh clip mask sized to the pixmap.
+                entry.pixmap.fill(tiny_skia::Color::TRANSPARENT);
+
+                let mut cache_clip_mask = tiny_skia::Mask::new(
+                    entry.physical_size.width.max(1),
+                    entry.physical_size.height.max(1),
+                )
+                .expect("allocate texture-cache clip mask");
+
+                let cache_logical_size = Size::new(
+                    entry.size.width as f32,
+                    entry.size.height as f32,
+                );
+                let cache_damage = [Rectangle::with_size(cache_logical_size)];
+
+                Self::render_stack(
+                    &mut self.engine,
+                    &layers,
+                    &mut entry.pixmap.as_mut(),
+                    &mut cache_clip_mask,
+                    entry.scale_factor,
+                    &cache_damage,
+                    Color::TRANSPARENT,
+                    &self.texture_cache.entries,
+                );
+
+                let _ = self.texture_cache.entries.insert(id, entry);
+            }
+        }
+
+        // 2. Render the main scene.
+        self.layers.flush();
+        Self::render_stack(
+            &mut self.engine,
+            &self.layers,
+            pixels,
+            clip_mask,
+            scale_factor,
+            damage,
+            background_color,
+            &self.texture_cache.entries,
+        );
+
+        self.engine.trim();
+    }
+
+    fn render_stack(
+        engine: &mut Engine,
+        layers: &layer::Stack,
+        pixels: &mut tiny_skia::PixmapMut<'_>,
+        clip_mask: &mut tiny_skia::Mask,
+        scale_factor: f32,
+        damage: &[Rectangle],
+        background_color: Color,
+        texture_cache_entries: &rustc_hash::FxHashMap<u64, texture_cache::Entry>,
+    ) {
         for &damage_bounds in damage {
             let damage_bounds = damage_bounds * scale_factor;
 
@@ -97,7 +177,7 @@ impl Renderer {
                 None,
             );
 
-            for layer in self.layers.iter() {
+            for layer in layers.iter() {
                 let Some(layer_bounds) = damage_bounds.intersection(&(layer.bounds * scale_factor))
                 else {
                     continue;
@@ -108,7 +188,7 @@ impl Renderer {
                 if !layer.quads.is_empty() {
                     let render_span = debug::render(debug::Primitive::Quad);
                     for (quad, background) in &layer.quads {
-                        self.engine.draw_quad(
+                        engine.draw_quad(
                             quad,
                             background,
                             Transformation::scale(scale_factor),
@@ -133,7 +213,7 @@ impl Renderer {
                         engine::adjust_clip_mask(clip_mask, group_bounds);
 
                         for primitive in group.as_slice() {
-                            self.engine.draw_primitive(
+                            engine.draw_primitive(
                                 primitive,
                                 Transformation::scale(scale_factor) * group.transformation(),
                                 pixels,
@@ -152,7 +232,7 @@ impl Renderer {
                     let render_span = debug::render(debug::Primitive::Image);
 
                     for image in &layer.images {
-                        self.engine.draw_image(
+                        engine.draw_image(
                             image,
                             Transformation::scale(scale_factor),
                             pixels,
@@ -169,7 +249,7 @@ impl Renderer {
 
                     for group in &layer.text {
                         for text in group.as_slice() {
-                            self.engine.draw_text(
+                            engine.draw_text(
                                 text,
                                 Transformation::scale(scale_factor) * group.transformation(),
                                 pixels,
@@ -181,10 +261,38 @@ impl Renderer {
 
                     render_span.finish();
                 }
+
+                if !layer.cached_textures.is_empty() {
+                    let render_span = debug::render(debug::Primitive::Image);
+
+                    for instance in &layer.cached_textures {
+                        let Some(entry) = texture_cache_entries.get(&instance.cache_id)
+                        else {
+                            continue;
+                        };
+
+                        let dst_bounds = instance.bounds
+                            * Transformation::scale(scale_factor);
+
+                        let src_w = entry.physical_size.width.max(1) as f32;
+                        let src_h = entry.physical_size.height.max(1) as f32;
+                        let scale_x = dst_bounds.width / src_w;
+                        let scale_y = dst_bounds.height / src_h;
+
+                        let _ = pixels.draw_pixmap(
+                            dst_bounds.x as i32,
+                            dst_bounds.y as i32,
+                            entry.pixmap.as_ref(),
+                            &tiny_skia::PixmapPaint::default(),
+                            tiny_skia::Transform::from_scale(scale_x, scale_y),
+                            Some(clip_mask),
+                        );
+                    }
+
+                    render_span.finish();
+                }
             }
         }
-
-        self.engine.trim();
     }
 }
 
@@ -212,20 +320,85 @@ impl core::Renderer for Renderer {
 
     fn start_recording_texture(
         &mut self,
-        _cache: &TextureCache,
-        _size: Size<u32>,
-        _scale_factor: f32,
+        cache: &TextureCache,
+        size: Size<u32>,
+        scale_factor: f32,
     ) -> bool {
-        // TODO: implement pixmap-backed texture recording
-        false
+        let id = cache.id().as_u64();
+        let invalidated = cache.take_invalidated();
+
+        let physical_size = Size::new(
+            ((size.width as f32) * scale_factor).round() as u32,
+            ((size.height as f32) * scale_factor).round() as u32,
+        );
+
+        let needs_redraw = invalidated
+            || match self.texture_cache.entries.get(&id) {
+                Some(e) => {
+                    e.size != size
+                        || e.physical_size != physical_size
+                        || (e.scale_factor - scale_factor).abs() > f32::EPSILON
+                }
+                None => true,
+            };
+
+        if !needs_redraw {
+            return false;
+        }
+
+        let needs_alloc = match self.texture_cache.entries.get(&id) {
+            Some(e) => e.physical_size != physical_size,
+            None => true,
+        };
+
+        if needs_alloc {
+            let pixmap = tiny_skia::Pixmap::new(
+                physical_size.width.max(1),
+                physical_size.height.max(1),
+            )
+            .expect("allocate texture-cache pixmap");
+
+            let _ = self.texture_cache.entries.insert(
+                id,
+                texture_cache::Entry {
+                    pixmap,
+                    size,
+                    physical_size,
+                    scale_factor,
+                },
+            );
+        } else if let Some(entry) = self.texture_cache.entries.get_mut(&id) {
+            entry.size = size;
+            entry.scale_factor = scale_factor;
+        }
+
+        let bounds = Rectangle::with_size(Size::new(size.width as f32, size.height as f32));
+        let mut new_stack = layer::Stack::new();
+        new_stack.reset(bounds);
+
+        let saved = std::mem::replace(&mut self.layers, new_stack);
+        self.texture_cache.recording_stack.push((id, saved));
+
+        true
     }
 
     fn end_recording_texture(&mut self) {
-        // TODO: implement pixmap-backed texture recording
+        let Some((id, saved)) = self.texture_cache.recording_stack.pop() else {
+            return;
+        };
+
+        let captured = std::mem::replace(&mut self.layers, saved);
+        let _ = self.texture_cache.pending.insert(id, captured);
     }
 
-    fn draw_cached_texture(&mut self, _cache: &TextureCache, _bounds: Rectangle) {
-        // TODO: blit cached pixmap with current transformation
+    fn draw_cached_texture(&mut self, cache: &TextureCache, bounds: Rectangle) {
+        let id = cache.id().as_u64();
+        if !self.texture_cache.entries.contains_key(&id) {
+            return;
+        }
+
+        let (layer, transformation) = self.layers.current_mut();
+        layer.draw_cached_texture(id, bounds, transformation);
     }
 
     fn allocate_image(
