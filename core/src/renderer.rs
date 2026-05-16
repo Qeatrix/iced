@@ -4,7 +4,8 @@ mod null;
 
 use crate::image;
 use crate::{
-    Background, Border, Color, Font, Pixels, Rectangle, Shadow, Size, Transformation, Vector,
+    Background, Border, Color, Font, Pixels, Rectangle, Shadow, Size, TextureCache, Transformation,
+    Vector,
 };
 
 /// Whether anti-aliasing should be avoided by snapping primitive coordinates to the
@@ -52,6 +53,69 @@ pub trait Renderer {
 
     /// Fills a [`Quad`] with the provided [`Background`].
     fn fill_quad(&mut self, quad: Quad, background: impl Into<Background>);
+
+    /// Begins recording draw operations into the backing store keyed by the
+    /// given [`TextureCache`].
+    ///
+    /// Returns `true` if the renderer is now in recording mode and the caller
+    /// should issue the draw operations that should be cached. Returns
+    /// `false` if the cache is still fresh — in which case the caller must
+    /// skip recording and just call [`draw_cached_texture`] later.
+    ///
+    /// Callers must pair every `true` result with a matching call to
+    /// [`end_recording_texture`]. See [`draw_to_texture`] for the
+    /// recommended high-level wrapper.
+    ///
+    /// [`draw_cached_texture`]: Self::draw_cached_texture
+    /// [`end_recording_texture`]: Self::end_recording_texture
+    /// [`draw_to_texture`]: Self::draw_to_texture
+    fn start_recording_texture(
+        &mut self,
+        cache: &TextureCache,
+        size: Size<u32>,
+        scale_factor: f32,
+    ) -> bool;
+
+    /// Ends a recording session started with [`start_recording_texture`].
+    ///
+    /// [`start_recording_texture`]: Self::start_recording_texture
+    fn end_recording_texture(&mut self);
+
+    /// Records the drawing operations performed in the given closure into a
+    /// persistent backing store keyed by the [`TextureCache`] handle.
+    ///
+    /// If the cache is not invalidated and its existing backing store matches
+    /// `size` and `scale_factor`, the closure is skipped entirely and the
+    /// existing backing store is reused. Use [`draw_cached_texture`]
+    /// afterwards to composite the cache into the current frame.
+    ///
+    /// [`draw_cached_texture`]: Self::draw_cached_texture
+    fn draw_to_texture(
+        &mut self,
+        cache: &TextureCache,
+        size: Size<u32>,
+        scale_factor: f32,
+        f: impl FnOnce(&mut Self),
+    ) {
+        if self.start_recording_texture(cache, size, scale_factor) {
+            f(self);
+            self.end_recording_texture();
+        }
+    }
+
+    /// Composites a previously recorded [`TextureCache`] into the current
+    /// frame at the given `bounds`.
+    ///
+    /// The current transformation stack is honored, so wrap the call with
+    /// [`with_transformation`] to animate translate / scale / rotate of the
+    /// cached contents without re-rasterizing them.
+    ///
+    /// If the cache has not been populated yet (no successful prior
+    /// [`draw_to_texture`] call), this is a no-op.
+    ///
+    /// [`draw_to_texture`]: Self::draw_to_texture
+    /// [`with_transformation`]: Self::with_transformation
+    fn draw_cached_texture(&mut self, cache: &TextureCache, bounds: Rectangle);
 
     /// Creates an [`image::Allocation`] for the given [`image::Handle`] and calls the given callback with it.
     fn allocate_image(

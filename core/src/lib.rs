@@ -47,6 +47,7 @@ mod rotation;
 mod settings;
 mod shadow;
 mod size;
+mod texture_cache;
 mod transformation;
 mod vector;
 
@@ -80,6 +81,7 @@ pub use shell::Shell;
 pub use size::Size;
 pub use svg::Svg;
 pub use text::Text;
+pub use texture_cache::TextureCache;
 pub use theme::Theme;
 pub use transformation::Transformation;
 pub use vector::Vector;

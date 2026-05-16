@@ -4,7 +4,9 @@ use crate::core::font;
 use crate::core::image;
 use crate::core::renderer;
 use crate::core::svg;
-use crate::core::{self, Background, Color, Image, Point, Rectangle, Size, Svg, Transformation};
+use crate::core::{
+    self, Background, Color, Image, Point, Rectangle, Size, Svg, TextureCache, Transformation,
+};
 use crate::graphics::compositor;
 use crate::graphics::mesh;
 use crate::graphics::text;
@@ -60,6 +62,27 @@ where
 
     fn end_transformation(&mut self) {
         delegate!(self, renderer, renderer.end_transformation());
+    }
+
+    fn start_recording_texture(
+        &mut self,
+        cache: &TextureCache,
+        size: Size<u32>,
+        scale_factor: f32,
+    ) -> bool {
+        delegate!(
+            self,
+            renderer,
+            renderer.start_recording_texture(cache, size, scale_factor)
+        )
+    }
+
+    fn end_recording_texture(&mut self) {
+        delegate!(self, renderer, renderer.end_recording_texture());
+    }
+
+    fn draw_cached_texture(&mut self, cache: &TextureCache, bounds: Rectangle) {
+        delegate!(self, renderer, renderer.draw_cached_texture(cache, bounds));
     }
 
     fn allocate_image(

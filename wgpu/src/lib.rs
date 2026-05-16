@@ -60,7 +60,9 @@ pub use primitive::Primitive;
 pub use geometry::Geometry;
 
 use crate::core::renderer;
-use crate::core::{Background, Color, Font, Pixels, Point, Rectangle, Size, Transformation};
+use crate::core::{
+    Background, Color, Font, Pixels, Point, Rectangle, Size, TextureCache, Transformation,
+};
 use crate::graphics::mesh;
 use crate::graphics::text::{Editor, Paragraph};
 use crate::graphics::{Shell, Viewport};
@@ -682,6 +684,24 @@ impl core::Renderer for Renderer {
     fn fill_quad(&mut self, quad: core::renderer::Quad, background: impl Into<Background>) {
         let (layer, transformation) = self.layers.current_mut();
         layer.draw_quad(quad, background.into(), transformation);
+    }
+
+    fn start_recording_texture(
+        &mut self,
+        _cache: &TextureCache,
+        _size: Size<u32>,
+        _scale_factor: f32,
+    ) -> bool {
+        // TODO: implement deferred texture recording
+        false
+    }
+
+    fn end_recording_texture(&mut self) {
+        // TODO: implement deferred texture recording
+    }
+
+    fn draw_cached_texture(&mut self, _cache: &TextureCache, _bounds: Rectangle) {
+        // TODO: implement cached texture sampling
     }
 
     fn allocate_image(
