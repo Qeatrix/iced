@@ -283,7 +283,13 @@ impl Renderer {
                             dst_bounds.x as i32,
                             dst_bounds.y as i32,
                             entry.pixmap.as_ref(),
-                            &tiny_skia::PixmapPaint::default(),
+                            // Bilinear so a supersampled (ss > 1) pixmap is
+                            // antialiased on downscale; at ss == 1 the scale is
+                            // 1.0 at an integer destination, so this is exact.
+                            &tiny_skia::PixmapPaint {
+                                quality: tiny_skia::FilterQuality::Bilinear,
+                                ..Default::default()
+                            },
                             tiny_skia::Transform::from_scale(scale_x, scale_y),
                             Some(clip_mask),
                         );
