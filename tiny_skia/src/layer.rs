@@ -15,6 +15,7 @@ pub struct CachedTexture {
     pub cache_id: u64,
     pub bounds: Rectangle,
     pub transformation: Transformation,
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +42,7 @@ impl Layer {
     pub fn draw_cached_texture(
         &mut self,
         cache_id: u64,
+        generation: u64,
         bounds: Rectangle,
         transformation: Transformation,
     ) {
@@ -48,6 +50,7 @@ impl Layer {
             cache_id,
             bounds: bounds * transformation,
             transformation: Transformation::IDENTITY,
+            generation,
         });
     }
 
@@ -314,9 +317,25 @@ impl Layer {
             Image::eq,
         );
 
+        // Cached textures bake their compositing transform into `bounds`, so a
+        // change in position (or content re-record, signalled via `generation`)
+        // shows up as inequality and damages both the old and new regions.
+        let cached_textures = damage::list(
+            &previous.cached_textures,
+            &current.cached_textures,
+            |instance| vec![instance.bounds.expand(1.0)],
+            |a, b| {
+                a.cache_id == b.cache_id
+                    && a.bounds == b.bounds
+                    && a.transformation == b.transformation
+                    && a.generation == b.generation
+            },
+        );
+
         damage.extend(text);
         damage.extend(primitives);
         damage.extend(images);
+        damage.extend(cached_textures);
         damage
     }
 }

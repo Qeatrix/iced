@@ -24,6 +24,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub struct TextureCache {
     id: Id,
     invalidated: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
 }
 
 /// A stable identifier for a [`TextureCache`]. Used by renderers to key their
@@ -47,6 +48,7 @@ impl TextureCache {
         Self {
             id: Id(NEXT_ID.fetch_add(1, Ordering::Relaxed)),
             invalidated: Arc::new(AtomicBool::new(true)),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -57,8 +59,22 @@ impl TextureCache {
 
     /// Marks the cache as invalidated. The next call to `draw_to_texture`
     /// will re-record drawing operations and re-render the backing store.
+    ///
+    /// This also bumps the [`generation`], so damage-tracking backends
+    /// (e.g. `tiny_skia`) repaint the cached region even when the cache is
+    /// composited at the exact same position as the previous frame.
+    ///
+    /// [`generation`]: Self::generation
     pub fn invalidate(&self) {
         self.invalidated.store(true, Ordering::Release);
+        let _ = self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Returns a counter that changes whenever the cache's contents are
+    /// invalidated. Damage-tracking backends include this in their per-frame
+    /// equality check so an in-place content refresh is not optimized away.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     /// Atomically reads the invalidated flag and resets it to `false`.
