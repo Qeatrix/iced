@@ -531,7 +531,7 @@ pub use crate::core::theme;
 pub use crate::core::{
     Alignment, Animation, Background, Border, Color, ContentFit, Degrees, Function, Gradient,
     Length, Never, Padding, Pixels, Point, Radians, Rectangle, Rotation, Settings, Shadow, Size,
-    Theme, Transformation, Vector, never,
+    TextureCache, Theme, Transformation, Vector, never,
 };
 pub use crate::program::Preset;
 pub use crate::program::message;
