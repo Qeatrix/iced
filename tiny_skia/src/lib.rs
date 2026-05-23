@@ -397,8 +397,9 @@ impl core::Renderer for Renderer {
             return;
         }
 
+        let generation = cache.generation();
         let (layer, transformation) = self.layers.current_mut();
-        layer.draw_cached_texture(id, bounds, transformation);
+        layer.draw_cached_texture(id, generation, bounds, transformation);
     }
 
     fn allocate_image(
