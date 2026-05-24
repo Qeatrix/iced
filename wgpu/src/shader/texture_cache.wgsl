@@ -39,12 +39,17 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
     return out;
 }
 
-// Mitchell-Netravali cubic weight (B = C = 1/3): a smooth reconstruction
-// kernel that, sampled at a varying sub-pixel phase, produces far less
-// "breathing" of thin high-contrast features than hardware bilinear.
+// Catmull-Rom cubic weight (B = 0, C = 1/2): an interpolating reconstruction
+// kernel (it passes through the source texels, so it is exact at integer phase)
+// with a mild high-frequency boost. At fractional sub-pixel phases it keeps
+// moving edges sharper than hardware bilinear — and sharper than the smoother
+// Mitchell (B = C = 1/3) we used before, whose approximating center weight
+// softened text during a translate. The negative lobes can ring slightly on
+// mid-tone edges; on high-contrast (near black-on-white) text the overshoot is
+// clamped away.
 fn cubic_weight(x_in: f32) -> f32 {
-    let b = 1.0 / 3.0;
-    let c = 1.0 / 3.0;
+    let b = 0.0;
+    let c = 0.5;
     let x = abs(x_in);
     let x2 = x * x;
     let x3 = x2 * x;
@@ -68,9 +73,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let coord = in.uv * dims - vec2<f32>(0.5);
 
     // When the cache lands exactly on the device-pixel grid (e.g. the widget
-    // snapped a static transform), one texel maps to one device pixel: sample
-    // it directly so the result is pixel-perfect crisp. Bicubic would otherwise
-    // soften even an aligned image, since Mitchell is an approximating filter.
+    // snapped a static transform), one texel maps to one device pixel: sample it
+    // directly. This is a pure optimization — Catmull-Rom is already exact at
+    // integer phase, so the 16-tap path below returns the same texel — it just
+    // skips the loop for the common snapped/at-rest case.
     let nearest = round(coord);
     let frac = coord - nearest;
     if (max(abs(frac.x), abs(frac.y)) < 0.01) {
@@ -79,7 +85,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // Otherwise (mid-animation, fractional offset) reconstruct with a 4x4
-    // Mitchell bicubic to suppress the resampling shimmer of moving edges.
+    // Catmull-Rom bicubic: sharp resampling of the moving edges.
     let base = floor(coord);
     let f = coord - base;
     let wx = vec4<f32>(
