@@ -400,14 +400,3 @@ impl Default for Layer {
         }
     }
 }
-
-pub fn debug_layer_color(i: u32) -> Color {
-    let frequency = i as f32 * 0.4;
-
-    Color {
-        r: (frequency + 0.0).sin() * 0.5 + 0.5,
-        g: (frequency + 2.0).sin() * 0.5 + 0.5,
-        b: (frequency + 4.0).sin() * 0.5 + 0.5,
-        a: 1.0,
-    }
-}

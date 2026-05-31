@@ -27,7 +27,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use crate::{Rectangle, Size, TextureCache, Transformation};
+use crate::{Color, Rectangle, Size, TextureCache, Transformation};
 
 /// Enables debug outline drawing on layers if `ICED_DEBUG_LAYERS` is set.
 pub static DEBUG_LAYERS: LazyLock<bool> =
@@ -210,5 +210,21 @@ impl LayerRegistry {
 impl Default for LayerRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Generates a procedural color based on a layer's depth index.
+///
+/// This function uses phase-shifted sine waves to produce a distinct,
+/// deterministic color for each layer depth. It is primarily used for
+/// visual debugging to help easily distinguish nested or overlapping layers.
+pub fn debug_layer_color(i: u32) -> Color {
+    let frequency = i as f32 * 0.4;
+
+    Color {
+        r: (frequency + 0.0).sin() * 0.5 + 0.5,
+        g: (frequency + 2.0).sin() * 0.5 + 0.5,
+        b: (frequency + 4.0).sin() * 0.5 + 0.5,
+        a: 1.0,
     }
 }

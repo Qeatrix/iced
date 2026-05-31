@@ -69,7 +69,6 @@ use crate::core::{
 use crate::graphics::mesh;
 use crate::graphics::text::{Editor, Paragraph};
 use crate::graphics::{Shell, Viewport};
-use crate::layer::debug_layer_color;
 use std::sync::Arc;
 
 /// A [`wgpu`] graphics renderer for [`iced`].
@@ -1069,8 +1068,7 @@ fn compose_outline_one(renderer: &mut Renderer, slots: &[Arc<LayerSlot>], idx: u
     let data = slot.read();
     let id = slot.id();
 
-    // let color = DEBUG_LAYER_COLORS[depth as usize % DEBUG_LAYER_COLORS.len()];
-    let color = debug_layer_color(depth);
+    let color = core::layer::debug_layer_color(depth);
     let text_size = 14.0;
     let label_clip = data.bounds.expand(text_size * 2 as f32);
 

@@ -309,32 +309,6 @@ impl Renderer {
 /// nesting or accidental cycles in layer `parent_id` graphs.
 const MAX_LAYER_DEPTH: u32 = 64;
 
-/// Composites every registered slot into the renderer's existing
-/// layer stack. The traversal walks from roots (slots with no
-/// registered parent) downward, applying `clip_bounds` via
-/// `with_layer` and `transform` via `with_transformation` so that
-/// children inherit both naturally.
-fn compose_layers_impl(renderer: &mut Renderer, registry: &LayerRegistry, debug_outline: bool) {
-    let slots = registry.registered();
-    if slots.is_empty() {
-        return;
-    }
-
-    renderer.compose_index.clear();
-    for (i, s) in slots.iter().enumerate() {
-        if let Some(p) = s.read().parent_id {
-            renderer.compose_index.push((p, i));
-        }
-    }
-    renderer.compose_index.sort_by_key(|(p, _)| *p);
-
-    for i in 0..slots.len() {
-        if slots[i].read().parent_id.is_none() {
-            compose_one(renderer, slots, i, 0);
-        }
-    }
-}
-
 fn compose_one(renderer: &mut Renderer, slots: &[Arc<LayerSlot>], idx: usize, depth: u32) {
     use core::Renderer as _;
 
@@ -371,6 +345,7 @@ fn compose_one(renderer: &mut Renderer, slots: &[Arc<LayerSlot>], idx: usize, de
 
 fn compose_one_outline(renderer: &mut Renderer, slots: &[Arc<LayerSlot>], idx: usize, depth: u32) {
     use core::Renderer as _;
+    use core::text::Renderer as _;
 
     if depth >= MAX_LAYER_DEPTH {
         debug_assert!(false, "layer depth exceeded {}", MAX_LAYER_DEPTH);
@@ -381,8 +356,46 @@ fn compose_one_outline(renderer: &mut Renderer, slots: &[Arc<LayerSlot>], idx: u
     let data = slot.read();
     let id = slot.id();
 
+    let color = core::layer::debug_layer_color(depth);
+    let text_size = 14.0;
+    let label_clip = data.bounds.expand(text_size * 2 as f32);
+
     let paint = move |renderer: &mut Renderer| {
-        renderer.draw_cached_texture(&slot.cache, data.bounds);
+        renderer.fill_quad(
+            core::renderer::Quad {
+                bounds: data.bounds,
+                border: core::Border {
+                    color,
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                snap: true,
+                ..Default::default()
+            },
+            Color::TRANSPARENT,
+        );
+
+        let gap = 4.0;
+        let text_position = Point::new(data.bounds.x, data.bounds.y - text_size - gap);
+
+        renderer.fill_text(
+            core::Text {
+                content: format!("Layer #{:#?}", id.as_u64()),
+                bounds: data.bounds.size(),
+                size: 14.into(),
+                line_height: core::text::LineHeight::default(),
+                font: Default::default(),
+                align_x: core::text::Alignment::Left,
+                align_y: core::alignment::Vertical::Top,
+                shaping: core::text::Shaping::Basic,
+                wrapping: core::text::Wrapping::None,
+                ellipsis: core::text::Ellipsis::None,
+                hint_factor: None,
+            },
+            text_position,
+            color,
+            label_clip,
+        );
 
         let start = renderer.compose_index.partition_point(|(p, _)| *p < id);
         let end = renderer.compose_index.partition_point(|(p, _)| *p <= id);
@@ -391,16 +404,13 @@ fn compose_one_outline(renderer: &mut Renderer, slots: &[Arc<LayerSlot>], idx: u
             .map(|(_, i)| *i)
             .collect();
         for ci in children {
-            compose_one(renderer, slots, ci, depth + 1);
+            compose_one_outline(renderer, slots, ci, depth + 1);
         }
     };
 
-    match data.clip_bounds {
-        Some(clip) => renderer.with_layer(clip, move |r| {
-            r.with_transformation(data.transform, paint);
-        }),
-        None => renderer.with_transformation(data.transform, paint),
-    }
+    renderer.with_layer(Rectangle::INFINITE, move |r| {
+        r.with_transformation(data.transform, paint);
+    });
 }
 
 impl core::Renderer for Renderer {
@@ -537,6 +547,10 @@ impl core::Renderer for Renderer {
         for i in 0..slots.len() {
             if slots[i].read().parent_id.is_none() {
                 compose_one(self, slots, i, 0);
+
+                if debug_outline {
+                    compose_one_outline(self, slots, i, 0);
+                }
             }
         }
     }
