@@ -1,10 +1,12 @@
 struct Uniforms {
     transform: mat4x4<f32>,
     bounds: vec4<f32>,  // x, y, w, h in logical pixels
-    scale: f32,
-    _pad0: f32,
-    _pad1: f32,
-    _pad2: f32,
+    // [uv_max.x, uv_max.y, scale, _pad]. `uv_max` is the fraction of the
+    // texture dimensions that actually holds content (the texture may be
+    // over-allocated to amortize realloc cost during resize). UV sampling
+    // is scaled by it so we never sample the transparent over-allocated
+    // region, which would otherwise show as a squish + transparent strip.
+    uv_max_and_scale: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -34,7 +36,7 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
     );
 
     var out: VertexOutput;
-    out.clip_position = u.transform * vec4<f32>(local * u.scale, 0.0, 1.0);
+    out.clip_position = u.transform * vec4<f32>(local * u.uv_max_and_scale.z, 0.0, 1.0);
     out.uv = uv;
     return out;
 }
@@ -69,8 +71,14 @@ fn cubic_weight(x_in: f32) -> f32 {
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let dims = vec2<f32>(textureDimensions(u_texture));
-    // Continuous texel coordinate (texel centers at integers).
-    let coord = in.uv * dims - vec2<f32>(0.5);
+    // Effective content dimensions inside the (possibly over-allocated)
+    // texture. `uv_max == 1` recovers the pre-quantization sampling where
+    // the content fills the whole texture.
+    let content_dims = dims * u.uv_max_and_scale.xy;
+    // Continuous texel coordinate (texel centers at integers), scaled so
+    // quad-UV [0,1] traverses exactly the content sub-region rather than
+    // the full texture.
+    let coord = in.uv * content_dims - vec2<f32>(0.5);
 
     // When the cache lands exactly on the device-pixel grid (e.g. the widget
     // snapped a static transform), one texel maps to one device pixel: sample it

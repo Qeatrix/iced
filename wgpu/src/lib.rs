@@ -60,13 +60,17 @@ pub use primitive::Primitive;
 #[cfg(feature = "geometry")]
 pub use geometry::Geometry;
 
+use crate::core::layer::{LayerId, LayerRegistry, LayerSlot};
 use crate::core::renderer;
 use crate::core::{
-    Background, Color, Font, Pixels, Point, Rectangle, Size, TextureCache, Transformation,
+    Background, Color, Font, Pixels, Point, Rectangle, Size, TextureCache, TextureRecordMode,
+    Transformation,
 };
 use crate::graphics::mesh;
 use crate::graphics::text::{Editor, Paragraph};
 use crate::graphics::{Shell, Viewport};
+use crate::layer::debug_layer_color;
+use std::sync::Arc;
 
 /// A [`wgpu`] graphics renderer for [`iced`].
 ///
@@ -94,6 +98,11 @@ pub struct Renderer {
     texture_cache: texture_cache::Storage,
     texture_cache_state: texture_cache::FrameState,
 
+    /// Reused scratch index for `compose_layers`. Cleared at the
+    /// start of every compose pass; capacity persists frame-to-frame
+    /// so no allocation happens in steady state.
+    compose_index: Vec<(LayerId, usize)>,
+
     staging_belt: wgpu::util::StagingBelt,
 }
 
@@ -117,6 +126,7 @@ impl Renderer {
 
             texture_cache: texture_cache::Storage::new(),
             texture_cache_state: texture_cache::FrameState::new(),
+            compose_index: Vec::with_capacity(64),
 
             // TODO: Resize belt smartly (?)
             // It would be great if the `StagingBelt` API exposed methods
@@ -407,9 +417,7 @@ impl Renderer {
 
             if !layer.cached_textures.is_empty() {
                 // Allocate or reuse this layer's compositing state.
-                if self.texture_cache_state.layers.len()
-                    <= self.texture_cache_state.prepare_layer
-                {
+                if self.texture_cache_state.layers.len() <= self.texture_cache_state.prepare_layer {
                     self.texture_cache_state
                         .layers
                         .push(texture_cache::LayerState::new());
@@ -423,8 +431,8 @@ impl Renderer {
                     .as_ref()
                     .expect("texture_cache pipeline must exist when drawing cached textures");
 
-                let layer_state = &mut self.texture_cache_state.layers
-                    [self.texture_cache_state.prepare_layer];
+                let layer_state =
+                    &mut self.texture_cache_state.layers[self.texture_cache_state.prepare_layer];
 
                 layer_state.ensure_capacity(
                     &self.engine.device,
@@ -433,6 +441,26 @@ impl Renderer {
                 );
 
                 for (index, instance) in layer.cached_textures.iter().enumerate() {
+                    // `uv_max` tells the composite shader which sub-region of
+                    // the (possibly over-allocated) cache texture actually
+                    // holds content. Without it, an over-allocated texture
+                    // would either show a transparent strip on the right /
+                    // bottom or squish the content into the quad — see
+                    // `texture_cache::Uniforms`.
+                    let uv_max = self
+                        .texture_cache
+                        .entries
+                        .get(&instance.cache_id)
+                        .map(|entry| {
+                            [
+                                entry.physical_size.width as f32
+                                    / entry.texture_capacity_size.width.max(1) as f32,
+                                entry.physical_size.height as f32
+                                    / entry.texture_capacity_size.height.max(1) as f32,
+                            ]
+                        })
+                        .unwrap_or([1.0, 1.0]);
+
                     layer_state.write_instance(
                         &mut self.staging_belt,
                         encoder,
@@ -442,6 +470,7 @@ impl Renderer {
                         instance,
                         viewport.projection(),
                         scale_factor,
+                        uv_max,
                     );
                 }
 
@@ -692,8 +721,7 @@ impl Renderer {
                     .as_ref()
                     .expect("texture_cache pipeline must exist");
 
-                let layer_state =
-                    &self.texture_cache_state.layers[cached_texture_layer];
+                let layer_state = &self.texture_cache_state.layers[cached_texture_layer];
 
                 // Build (index, &texture_bind_group) pairs for instances whose
                 // backing entry is still present.
@@ -770,6 +798,16 @@ impl Renderer {
         physical_size: Size<u32>,
         scale_factor: f32,
     ) {
+        /// Geometric growth for one axis of the cache texture. Returns the
+        /// smallest power-of-two ≥ `needed`, with a 128-px floor, but never
+        /// shrinks below `current` so we don't oscillate when the user
+        /// drag-resizes back and forth.
+        fn grow_capacity(needed: u32, current: u32) -> u32 {
+            const MIN_CAPACITY: u32 = 128;
+            let target = needed.max(MIN_CAPACITY).next_power_of_two();
+            target.max(current)
+        }
+
         // Lazily initialize the sampling pipeline.
         if self.texture_cache.pipeline.is_none() {
             self.texture_cache.pipeline = Some(texture_cache::Pipeline::new(
@@ -783,24 +821,55 @@ impl Renderer {
             .as_ref()
             .expect("texture_cache pipeline initialized");
 
-        let needs_alloc = match self.texture_cache.entries.get(&id) {
-            Some(e) => e.physical_size != physical_size,
-            None => true,
-        };
+        // The existing texture's allocated dimensions. We can keep the texture
+        // (skip the GPU realloc) whenever the new content fits inside it.
+        let existing_capacity = self
+            .texture_cache
+            .entries
+            .get(&id)
+            .map(|e| e.texture_capacity_size);
 
-        if !needs_alloc {
+        let fits = existing_capacity.map_or(false, |cap| {
+            cap.width >= physical_size.width && cap.height >= physical_size.height
+        });
+
+        if fits {
+            // Content shrank or grew within current capacity: no realloc,
+            // just patch the metadata. The compose shader will read the new
+            // `uv_max = physical_size / texture_capacity_size` and sample
+            // only the content sub-region of the existing texture.
             if let Some(entry) = self.texture_cache.entries.get_mut(&id) {
                 entry.size = size;
+                entry.physical_size = physical_size;
                 entry.scale_factor = scale_factor;
             }
             return;
         }
 
+        // Grow the texture geometrically (round each dimension up to the next
+        // power of two, with a 128-px floor). Rationale: during a drag-resize
+        // the per-frame physical size walks up in pixels of 1; reallocating
+        // the wgpu texture and its bind group every frame hammers the
+        // allocator and dominates the stutter. A geometric grow amortizes
+        // realloc to O(log max_dim) over the lifetime of the cache, at a
+        // worst-case 2× memory overhead — the unused area is transparent and
+        // explicitly excluded from the composite via `uv_max`.
+        let target_capacity = Size::new(
+            grow_capacity(
+                physical_size.width,
+                existing_capacity.map(|c| c.width).unwrap_or(0),
+            ),
+            grow_capacity(
+                physical_size.height,
+                existing_capacity.map(|c| c.height).unwrap_or(0),
+            ),
+        );
+
         let texture = self.engine.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("iced_wgpu.texture_cache.texture"),
             size: wgpu::Extent3d {
-                width: physical_size.width.max(1),
-                height: physical_size.height.max(1),
+                width: target_capacity.width.max(1),
+                height: target_capacity.height.max(1),
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -815,17 +884,35 @@ impl Renderer {
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let texture_bind_group =
-            self.engine
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("iced_wgpu.texture_cache.texture_bind_group"),
-                    layout: &pipeline.texture_layout,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    }],
-                });
+        let texture_bind_group = self
+            .engine
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("iced_wgpu.texture_cache.texture_bind_group"),
+                layout: &pipeline.texture_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                }],
+            });
+
+        // Update-in-place when an entry already exists: keep its per-cache
+        // `quad`/`triangle`/`text`/`text_viewport`/`image` `State`s so the
+        // already-warmed wgpu buffers, bind groups, and `TextRenderer`s are
+        // reused across the realloc. The discarded `State`s on every resize
+        // were the dominant source of first-resize stutter — none of them
+        // hold anything tied to a specific texture-target size (`text_viewport`
+        // is re-`update()`d with the new physical size in `prepare`).
+        if let Some(entry) = self.texture_cache.entries.get_mut(&id) {
+            entry.texture = texture;
+            entry.view = view;
+            entry.texture_bind_group = texture_bind_group;
+            entry.size = size;
+            entry.physical_size = physical_size;
+            entry.texture_capacity_size = target_capacity;
+            entry.scale_factor = scale_factor;
+            return;
+        }
 
         let entry = texture_cache::Entry {
             texture,
@@ -833,12 +920,10 @@ impl Renderer {
             texture_bind_group,
             size,
             physical_size,
+            texture_capacity_size: target_capacity,
             scale_factor,
             quad: quad::State::new(),
-            triangle: triangle::State::new(
-                &self.engine.device,
-                &self.engine.triangle_pipeline,
-            ),
+            triangle: triangle::State::new(&self.engine.device, &self.engine.triangle_pipeline),
             text: text::State::new(),
             text_viewport: self
                 .engine
@@ -860,11 +945,7 @@ impl Renderer {
             return;
         }
 
-        let pending: Vec<_> = self
-            .texture_cache
-            .pending
-            .drain()
-            .collect();
+        let pending: Vec<_> = self.texture_cache.pending.drain(..).collect();
 
         for (id, layers) in pending {
             // Briefly take ownership of the entry to avoid a double mutable
@@ -873,10 +954,14 @@ impl Renderer {
                 continue;
             };
 
-            let cache_viewport = Viewport::with_physical_size(
-                entry.physical_size,
-                entry.scale_factor,
-            );
+            // The viewport's `physical_size` must match the GPU texture's
+            // allocated dimensions (not the content's `physical_size`), so the
+            // orthographic projection lands content at its actual physical
+            // pixels within the over-allocated texture. With the wrong size
+            // here, NDC=±1 would map to the texture's edges, stretching
+            // content across the entire texture.
+            let cache_viewport =
+                Viewport::with_physical_size(entry.texture_capacity_size, entry.scale_factor);
 
             // Swap dedicated state with main renderer's per-frame state.
             std::mem::swap(&mut self.quad, &mut entry.quad);
@@ -919,6 +1004,134 @@ impl Renderer {
     }
 }
 
+/// Maximum compose-recursion depth. Guards against pathological
+/// nesting or accidental cycles in layer `parent_id` graphs.
+const MAX_LAYER_DEPTH: u32 = 64;
+
+fn compose_one(renderer: &mut Renderer, slots: &[Arc<LayerSlot>], idx: usize, depth: u32) {
+    use core::Renderer as _;
+
+    if depth >= MAX_LAYER_DEPTH {
+        debug_assert!(false, "layer depth exceeded {}", MAX_LAYER_DEPTH);
+        return;
+    }
+
+    let slot = slots[idx].clone();
+    let data = slot.read();
+    let id = slot.id();
+
+    // The compose body: paint this slot's cache (no-op when
+    // unrecorded — that's the group-layer case, e.g. content_stack)
+    // and recurse into children inside the parent's transform block.
+    let paint = move |renderer: &mut Renderer| {
+        renderer.draw_cached_texture(&slot.cache, data.bounds);
+
+        // Recurse into children. `partition_point` finds the
+        // contiguous run of `compose_index` whose parent_id matches.
+        let start = renderer.compose_index.partition_point(|(p, _)| *p < id);
+        let end = renderer.compose_index.partition_point(|(p, _)| *p <= id);
+
+        // Snapshot the child indices into a local Vec so we don't
+        // hold a borrow on `renderer.compose_index` across the
+        // recursive call (which needs `&mut renderer`). In practice
+        // the slice is small and short-lived.
+        let children: Vec<usize> = renderer.compose_index[start..end]
+            .iter()
+            .map(|(_, i)| *i)
+            .collect();
+
+        for ci in children {
+            compose_one(renderer, slots, ci, depth + 1);
+        }
+    };
+
+    // Wrap in the slot's transform, then optionally in its clip.
+    // `with_layer` must be outermost so the clip survives the
+    // transform (clip bounds are absolute, not transform-relative).
+    match data.clip_bounds {
+        Some(clip) => renderer.with_layer(clip, move |r| {
+            r.with_transformation(data.transform, paint);
+        }),
+        None => renderer.with_transformation(data.transform, paint),
+    }
+}
+
+fn compose_outline_one(renderer: &mut Renderer, slots: &[Arc<LayerSlot>], idx: usize, depth: u32) {
+    use core::Renderer as _;
+    use core::text::Renderer as _;
+
+    if depth >= MAX_LAYER_DEPTH {
+        debug_assert!(false, "layer depth exceeded {}", MAX_LAYER_DEPTH);
+        return;
+    }
+
+    let slot = slots[idx].clone();
+    let data = slot.read();
+    let id = slot.id();
+
+    // let color = DEBUG_LAYER_COLORS[depth as usize % DEBUG_LAYER_COLORS.len()];
+    let color = debug_layer_color(depth);
+    let text_size = 14.0;
+    let label_clip = data.bounds.expand(text_size * 2 as f32);
+
+    let paint = move |renderer: &mut Renderer| {
+        renderer.fill_quad(
+            core::renderer::Quad {
+                bounds: data.bounds,
+                border: core::Border {
+                    color,
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                snap: true,
+                ..Default::default()
+            },
+            Color::TRANSPARENT,
+        );
+
+        let gap = 4.0;
+        let text_position = Point::new(data.bounds.x, data.bounds.y - text_size - gap);
+
+        renderer.fill_text(
+            core::Text {
+                content: format!("Layer #{:#?}", id.as_u64()),
+                bounds: data.bounds.size(),
+                size: 14.into(),
+                line_height: core::text::LineHeight::default(),
+                font: Default::default(),
+                align_x: core::text::Alignment::Left,
+                align_y: core::alignment::Vertical::Top,
+                shaping: core::text::Shaping::Basic,
+                wrapping: core::text::Wrapping::None,
+                ellipsis: core::text::Ellipsis::None,
+                hint_factor: None,
+            },
+            text_position,
+            color,
+            label_clip,
+        );
+
+        let start = renderer.compose_index.partition_point(|(p, _)| *p < id);
+        let end = renderer.compose_index.partition_point(|(p, _)| *p <= id);
+
+        let children: Vec<usize> = renderer.compose_index[start..end]
+            .iter()
+            .map(|(_, i)| *i)
+            .collect();
+
+        for ci in children {
+            compose_outline_one(renderer, slots, ci, depth + 1);
+        }
+    };
+
+    // Wrap in the slot's transform, then optionally in its clip.
+    // `with_layer` must be outermost so the clip survives the
+    // transform (clip bounds are absolute, not transform-relative).
+    renderer.with_layer(Rectangle::INFINITE, move |r| {
+        r.with_transformation(data.transform, paint);
+    });
+}
+
 impl core::Renderer for Renderer {
     fn start_layer(&mut self, bounds: Rectangle) {
         self.layers.push_clip(bounds);
@@ -943,6 +1156,7 @@ impl core::Renderer for Renderer {
 
     fn start_recording_texture(
         &mut self,
+        mode: TextureRecordMode,
         cache: &TextureCache,
         size: Size<u32>,
         scale_factor: f32,
@@ -965,29 +1179,41 @@ impl core::Renderer for Renderer {
                 None => true,
             };
 
-        if !needs_redraw {
-            return false;
-        }
+        let keep = match mode {
+            TextureRecordMode::Flush => {
+                if !needs_redraw {
+                    return false;
+                }
 
-        self.ensure_texture_cache_entry(id, size, physical_size, scale_factor);
+                true
+            }
+            TextureRecordMode::TraverseOnly => needs_redraw,
+        };
+
+        if keep {
+            self.ensure_texture_cache_entry(id, size, physical_size, scale_factor);
+        }
 
         let bounds = Rectangle::with_size(Size::new(size.width as f32, size.height as f32));
         let mut new_stack = layer::Stack::new();
         new_stack.reset(bounds);
 
         let saved = std::mem::replace(&mut self.layers, new_stack);
-        self.texture_cache.recording_stack.push((id, saved));
+        self.texture_cache.recording_stack.push((id, saved, keep));
 
         true
     }
 
     fn end_recording_texture(&mut self) {
-        let Some((id, saved)) = self.texture_cache.recording_stack.pop() else {
+        let Some((id, saved, keep)) = self.texture_cache.recording_stack.pop() else {
             return;
         };
 
         let captured = std::mem::replace(&mut self.layers, saved);
-        let _ = self.texture_cache.pending.insert(id, captured);
+
+        if keep {
+            let _ = self.texture_cache.pending.insert(id, captured);
+        }
     }
 
     fn draw_cached_texture(&mut self, cache: &TextureCache, bounds: Rectangle) {
@@ -998,6 +1224,37 @@ impl core::Renderer for Renderer {
 
         let (layer, transformation) = self.layers.current_mut();
         layer.draw_cached_texture(id, bounds, transformation);
+    }
+
+    fn compose_layers(&mut self, registry: &LayerRegistry, debug_outline: bool) {
+        let slots = registry.registered();
+        if slots.is_empty() {
+            return;
+        }
+
+        // Build a sorted child index: (parent_id, slot_index). For N<~50,
+        // sorted `Vec` + `partition_point` is faster than a HashMap and
+        // reuses pre-allocated capacity.
+        self.compose_index.clear();
+        for (i, s) in slots.iter().enumerate() {
+            if let Some(p) = s.read().parent_id {
+                self.compose_index.push((p, i));
+            }
+        }
+        self.compose_index.sort_by_key(|(p, _)| *p);
+
+        // Walk roots in registration order. Skipping the linear scan here
+        // would require a second sorted index; for typical layer counts
+        // the scan is cheaper than that.
+        for i in 0..slots.len() {
+            if slots[i].read().parent_id.is_none() {
+                compose_one(self, slots, i, 0);
+
+                if debug_outline {
+                    compose_outline_one(self, slots, i, 0);
+                }
+            }
+        }
     }
 
     fn allocate_image(

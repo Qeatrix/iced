@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use crate::clipboard;
 use crate::event;
+use crate::layer::{LayerRegistry, LayerSlot};
 use crate::window;
 use crate::{Clipboard, InputMethod};
 
@@ -18,11 +21,35 @@ pub struct Shell<'a, Message> {
     is_layout_invalid: bool,
     are_widgets_invalid: bool,
     clipboard: Clipboard,
+    layers: Option<&'a mut LayerRegistry>,
 }
 
 impl<'a, Message> Shell<'a, Message> {
     /// Creates a new [`Shell`] with the provided buffer of messages.
+    ///
+    /// The shell will not participate in the compositor-layer protocol
+    /// (`register_layer`/`push_layer`/...) — those calls will be silent
+    /// no-ops. For layer-aware code use [`Shell::with_layers`].
     pub fn new(messages: &'a mut Vec<Message>) -> Self {
+        Self::with_layers(messages, None)
+    }
+
+    /// Creates a new [`Shell`] with the provided buffer of messages
+    /// and an optional reference to a [`LayerRegistry`].
+    ///
+    /// When `layers` is `Some(...)`, layer-aware widgets can register
+    /// compositor layers via [`register_layer`], push/pop the
+    /// parent-tracking stack with [`push_layer`]/[`pop_layer`], and
+    /// inspect ancestors via [`layer_stack_ancestors`].
+    ///
+    /// [`register_layer`]: Self::register_layer
+    /// [`push_layer`]: Self::push_layer
+    /// [`pop_layer`]: Self::pop_layer
+    /// [`layer_stack_ancestors`]: Self::layer_stack_ancestors
+    pub fn with_layers(
+        messages: &'a mut Vec<Message>,
+        layers: Option<&'a mut LayerRegistry>,
+    ) -> Self {
         Self {
             messages,
             event_status: event::Status::Ignored,
@@ -34,6 +61,7 @@ impl<'a, Message> Shell<'a, Message> {
                 reads: Vec::new(),
                 write: None,
             },
+            layers,
         }
     }
 
@@ -183,5 +211,66 @@ impl<'a, Message> Shell<'a, Message> {
 
         self.input_method.merge(&other.input_method);
         self.clipboard.merge(&mut other.clipboard);
+    }
+
+    /// Registers `slot` with this frame's [`LayerRegistry`], so the
+    /// renderer will composite it after the widget-tree draw walk
+    /// completes. Idempotent on `slot.id()`: a slot already registered
+    /// this frame is not added again.
+    ///
+    /// No-op if the shell was constructed via [`Shell::new`] (i.e.
+    /// without a layer registry).
+    pub fn register_layer(&mut self, slot: Arc<LayerSlot>) {
+        if let Some(layers) = self.layers.as_deref_mut() {
+            if layers.registered_ids.insert(slot.id()) {
+                layers.registered.push(slot);
+            }
+        }
+    }
+
+    /// Pushes `slot` onto the parent-tracking stack. Subsequent calls
+    /// to [`current_layer`] from inside a child's `update` will return
+    /// this slot. Must be paired with [`pop_layer`].
+    ///
+    /// No-op if the shell has no layer registry.
+    ///
+    /// [`current_layer`]: Self::current_layer
+    /// [`pop_layer`]: Self::pop_layer
+    pub fn push_layer(&mut self, slot: &Arc<LayerSlot>) {
+        if let Some(layers) = self.layers.as_deref_mut() {
+            layers.stack.push(slot.clone());
+        }
+    }
+
+    /// Pops the topmost slot from the parent-tracking stack. Must be
+    /// paired with [`push_layer`].
+    ///
+    /// No-op if the stack is empty or if the shell has no layer
+    /// registry.
+    ///
+    /// [`push_layer`]: Self::push_layer
+    pub fn pop_layer(&mut self) {
+        if let Some(layers) = self.layers.as_deref_mut() {
+            let _ = layers.stack.pop();
+        }
+    }
+
+    /// Returns the topmost slot on the parent-tracking stack, or
+    /// [`None`] if the stack is empty (top-level layer) or the shell
+    /// has no layer registry.
+    pub fn current_layer(&self) -> Option<&Arc<LayerSlot>> {
+        self.layers.as_deref().and_then(|l| l.stack.last())
+    }
+
+    /// Iterates over the layer stack from the immediate parent at the
+    /// top down to the outermost layer at the bottom. Useful for
+    /// cache-coupling: an `O(depth)` upward walk lets a widget
+    /// invalidate every ancestor layer when its own cache becomes
+    /// stale.
+    pub fn layer_stack_ancestors(&self) -> impl DoubleEndedIterator<Item = &Arc<LayerSlot>> {
+        self.layers
+            .as_deref()
+            .into_iter()
+            .flat_map(|l| l.stack.iter().rev())
     }
 }

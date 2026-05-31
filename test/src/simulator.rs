@@ -168,9 +168,12 @@ where
     pub fn simulate(&mut self, events: impl IntoIterator<Item = Event>) -> Vec<event::Status> {
         let events: Vec<Event> = events.into_iter().collect();
 
-        let (_state, statuses) =
-            self.raw
-                .update(&events, self.cursor, &mut self.renderer, &mut self.messages);
+        let (_state, statuses) = self.raw.update_without_layers(
+            &events,
+            self.cursor,
+            &mut self.renderer,
+            &mut self.messages,
+        );
 
         statuses
     }
@@ -179,7 +182,7 @@ where
     pub fn snapshot(&mut self, theme: &Theme) -> Result<Snapshot, Error> {
         let base = theme.base();
 
-        let _ = self.raw.update(
+        let _ = self.raw.update_without_layers(
             &[Event::Window(window::Event::RedrawRequested(
                 time::Instant::now(),
             ))],

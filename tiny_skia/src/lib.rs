@@ -27,14 +27,17 @@ pub use primitive::Primitive;
 #[cfg(feature = "geometry")]
 pub use geometry::Geometry;
 
+use crate::core::layer::{LayerId, LayerRegistry, LayerSlot};
 use crate::core::renderer;
 use crate::core::{
-    Background, Color, Font, Pixels, Point, Rectangle, Size, TextureCache, Transformation,
+    Background, Color, Font, Pixels, Point, Rectangle, Size, TextureCache, TextureRecordMode,
+    Transformation,
 };
 use crate::engine::Engine;
 use crate::graphics::Viewport;
 use crate::graphics::compositor;
 use crate::graphics::text::{Editor, Paragraph};
+use std::sync::Arc;
 
 /// A [`tiny-skia`] graphics renderer for [`iced`].
 ///
@@ -45,6 +48,10 @@ pub struct Renderer {
     layers: layer::Stack,
     engine: Engine, // TODO: Shared engine
     texture_cache: texture_cache::Storage,
+    /// Reused scratch index for `compose_layers`. Cleared at the
+    /// start of every compose pass; capacity persists frame-to-frame
+    /// so no allocation happens in steady state.
+    compose_index: Vec<(LayerId, usize)>,
 }
 
 impl std::fmt::Debug for Renderer {
@@ -64,6 +71,7 @@ impl Renderer {
             layers: layer::Stack::new(),
             engine: Engine::new(),
             texture_cache: texture_cache::Storage::new(),
+            compose_index: Vec::with_capacity(64),
         }
     }
 
@@ -84,8 +92,7 @@ impl Renderer {
 
         // 1. Flush pending texture caches into their backing pixmaps.
         if !self.texture_cache.pending.is_empty() {
-            let pending: Vec<(u64, layer::Stack)> =
-                self.texture_cache.pending.drain().collect();
+            let pending: Vec<(u64, layer::Stack)> = self.texture_cache.pending.drain(..).collect();
 
             for (id, mut layers) in pending {
                 let Some(mut entry) = self.texture_cache.entries.remove(&id) else {
@@ -104,10 +111,8 @@ impl Renderer {
                 )
                 .expect("allocate texture-cache clip mask");
 
-                let cache_logical_size = Size::new(
-                    entry.size.width as f32,
-                    entry.size.height as f32,
-                );
+                let cache_logical_size =
+                    Size::new(entry.size.width as f32, entry.size.height as f32);
                 let cache_damage = [Rectangle::with_size(cache_logical_size)];
 
                 Self::render_stack(
@@ -266,13 +271,11 @@ impl Renderer {
                     let render_span = debug::render(debug::Primitive::Image);
 
                     for instance in &layer.cached_textures {
-                        let Some(entry) = texture_cache_entries.get(&instance.cache_id)
-                        else {
+                        let Some(entry) = texture_cache_entries.get(&instance.cache_id) else {
                             continue;
                         };
 
-                        let dst_bounds = instance.bounds
-                            * Transformation::scale(scale_factor);
+                        let dst_bounds = instance.bounds * Transformation::scale(scale_factor);
 
                         let src_w = entry.physical_size.width.max(1) as f32;
                         let src_h = entry.physical_size.height.max(1) as f32;
@@ -302,6 +305,104 @@ impl Renderer {
     }
 }
 
+/// Maximum compose-recursion depth. Guards against pathological
+/// nesting or accidental cycles in layer `parent_id` graphs.
+const MAX_LAYER_DEPTH: u32 = 64;
+
+/// Composites every registered slot into the renderer's existing
+/// layer stack. The traversal walks from roots (slots with no
+/// registered parent) downward, applying `clip_bounds` via
+/// `with_layer` and `transform` via `with_transformation` so that
+/// children inherit both naturally.
+fn compose_layers_impl(renderer: &mut Renderer, registry: &LayerRegistry, debug_outline: bool) {
+    let slots = registry.registered();
+    if slots.is_empty() {
+        return;
+    }
+
+    renderer.compose_index.clear();
+    for (i, s) in slots.iter().enumerate() {
+        if let Some(p) = s.read().parent_id {
+            renderer.compose_index.push((p, i));
+        }
+    }
+    renderer.compose_index.sort_by_key(|(p, _)| *p);
+
+    for i in 0..slots.len() {
+        if slots[i].read().parent_id.is_none() {
+            compose_one(renderer, slots, i, 0);
+        }
+    }
+}
+
+fn compose_one(renderer: &mut Renderer, slots: &[Arc<LayerSlot>], idx: usize, depth: u32) {
+    use core::Renderer as _;
+
+    if depth >= MAX_LAYER_DEPTH {
+        debug_assert!(false, "layer depth exceeded {}", MAX_LAYER_DEPTH);
+        return;
+    }
+
+    let slot = slots[idx].clone();
+    let data = slot.read();
+    let id = slot.id();
+
+    let paint = move |renderer: &mut Renderer| {
+        renderer.draw_cached_texture(&slot.cache, data.bounds);
+
+        let start = renderer.compose_index.partition_point(|(p, _)| *p < id);
+        let end = renderer.compose_index.partition_point(|(p, _)| *p <= id);
+        let children: Vec<usize> = renderer.compose_index[start..end]
+            .iter()
+            .map(|(_, i)| *i)
+            .collect();
+        for ci in children {
+            compose_one(renderer, slots, ci, depth + 1);
+        }
+    };
+
+    match data.clip_bounds {
+        Some(clip) => renderer.with_layer(clip, move |r| {
+            r.with_transformation(data.transform, paint);
+        }),
+        None => renderer.with_transformation(data.transform, paint),
+    }
+}
+
+fn compose_one_outline(renderer: &mut Renderer, slots: &[Arc<LayerSlot>], idx: usize, depth: u32) {
+    use core::Renderer as _;
+
+    if depth >= MAX_LAYER_DEPTH {
+        debug_assert!(false, "layer depth exceeded {}", MAX_LAYER_DEPTH);
+        return;
+    }
+
+    let slot = slots[idx].clone();
+    let data = slot.read();
+    let id = slot.id();
+
+    let paint = move |renderer: &mut Renderer| {
+        renderer.draw_cached_texture(&slot.cache, data.bounds);
+
+        let start = renderer.compose_index.partition_point(|(p, _)| *p < id);
+        let end = renderer.compose_index.partition_point(|(p, _)| *p <= id);
+        let children: Vec<usize> = renderer.compose_index[start..end]
+            .iter()
+            .map(|(_, i)| *i)
+            .collect();
+        for ci in children {
+            compose_one(renderer, slots, ci, depth + 1);
+        }
+    };
+
+    match data.clip_bounds {
+        Some(clip) => renderer.with_layer(clip, move |r| {
+            r.with_transformation(data.transform, paint);
+        }),
+        None => renderer.with_transformation(data.transform, paint),
+    }
+}
+
 impl core::Renderer for Renderer {
     fn start_layer(&mut self, bounds: Rectangle) {
         self.layers.push_clip(bounds);
@@ -326,6 +427,7 @@ impl core::Renderer for Renderer {
 
     fn start_recording_texture(
         &mut self,
+        mode: TextureRecordMode,
         cache: &TextureCache,
         size: Size<u32>,
         scale_factor: f32,
@@ -348,34 +450,41 @@ impl core::Renderer for Renderer {
                 None => true,
             };
 
-        if !needs_redraw {
-            return false;
-        }
+        let keep = match mode {
+            TextureRecordMode::Flush => {
+                if !needs_redraw {
+                    return false;
+                }
 
-        let needs_alloc = match self.texture_cache.entries.get(&id) {
-            Some(e) => e.physical_size != physical_size,
-            None => true,
+                true
+            }
+            TextureRecordMode::TraverseOnly => needs_redraw,
         };
 
-        if needs_alloc {
-            let pixmap = tiny_skia::Pixmap::new(
-                physical_size.width.max(1),
-                physical_size.height.max(1),
-            )
-            .expect("allocate texture-cache pixmap");
+        if keep {
+            let needs_alloc = match self.texture_cache.entries.get(&id) {
+                Some(e) => e.physical_size != physical_size,
+                None => true,
+            };
 
-            let _ = self.texture_cache.entries.insert(
-                id,
-                texture_cache::Entry {
-                    pixmap,
-                    size,
-                    physical_size,
-                    scale_factor,
-                },
-            );
-        } else if let Some(entry) = self.texture_cache.entries.get_mut(&id) {
-            entry.size = size;
-            entry.scale_factor = scale_factor;
+            if needs_alloc {
+                let pixmap =
+                    tiny_skia::Pixmap::new(physical_size.width.max(1), physical_size.height.max(1))
+                        .expect("allocate texture-cache pixmap");
+
+                let _ = self.texture_cache.entries.insert(
+                    id,
+                    texture_cache::Entry {
+                        pixmap,
+                        size,
+                        physical_size,
+                        scale_factor,
+                    },
+                );
+            } else if let Some(entry) = self.texture_cache.entries.get_mut(&id) {
+                entry.size = size;
+                entry.scale_factor = scale_factor;
+            }
         }
 
         let bounds = Rectangle::with_size(Size::new(size.width as f32, size.height as f32));
@@ -383,18 +492,21 @@ impl core::Renderer for Renderer {
         new_stack.reset(bounds);
 
         let saved = std::mem::replace(&mut self.layers, new_stack);
-        self.texture_cache.recording_stack.push((id, saved));
+        self.texture_cache.recording_stack.push((id, saved, keep));
 
         true
     }
 
     fn end_recording_texture(&mut self) {
-        let Some((id, saved)) = self.texture_cache.recording_stack.pop() else {
+        let Some((id, saved, keep)) = self.texture_cache.recording_stack.pop() else {
             return;
         };
 
         let captured = std::mem::replace(&mut self.layers, saved);
-        let _ = self.texture_cache.pending.insert(id, captured);
+
+        if keep {
+            let _ = self.texture_cache.pending.push((id, captured));
+        }
     }
 
     fn draw_cached_texture(&mut self, cache: &TextureCache, bounds: Rectangle) {
@@ -406,6 +518,27 @@ impl core::Renderer for Renderer {
         let generation = cache.generation();
         let (layer, transformation) = self.layers.current_mut();
         layer.draw_cached_texture(id, generation, bounds, transformation);
+    }
+
+    fn compose_layers(&mut self, registry: &LayerRegistry, debug_outline: bool) {
+        let slots = registry.registered();
+        if slots.is_empty() {
+            return;
+        }
+
+        self.compose_index.clear();
+        for (i, s) in slots.iter().enumerate() {
+            if let Some(p) = s.read().parent_id {
+                self.compose_index.push((p, i));
+            }
+        }
+        self.compose_index.sort_by_key(|(p, _)| *p);
+
+        for i in 0..slots.len() {
+            if slots[i].read().parent_id.is_none() {
+                compose_one(self, slots, i, 0);
+            }
+        }
     }
 
     fn allocate_image(

@@ -1,5 +1,6 @@
 //! Implement your own event loop to drive a user interface.
 use crate::core::event::{self, Event};
+use crate::core::layer::LayerRegistry;
 use crate::core::layout;
 use crate::core::mouse;
 use crate::core::overlay;
@@ -182,6 +183,7 @@ where
         cursor: mouse::Cursor,
         renderer: &mut Renderer,
         messages: &mut Vec<Message>,
+        layers: &mut LayerRegistry,
     ) -> (State, Vec<event::Status>) {
         let mut outdated = false;
         let mut redraw_request = window::RedrawRequest::Wait;
@@ -210,7 +212,7 @@ where
             let mut event_statuses = Vec::new();
 
             for event in events {
-                let mut shell = Shell::new(messages);
+                let mut shell = Shell::with_layers(messages, Some(layers));
 
                 overlay.update(event, Layout::new(&layout), cursor, renderer, &mut shell);
 
@@ -302,7 +304,7 @@ where
                     return overlay_status;
                 }
 
-                let mut shell = Shell::new(messages);
+                let mut shell = Shell::with_layers(messages, Some(layers));
 
                 self.root.as_widget_mut().update(
                     &mut self.state,
@@ -388,6 +390,24 @@ where
             },
             event_statuses,
         )
+    }
+
+    /// Like [`update`](Self::update) but does not participate in the
+    /// compositor-layer protocol.
+    ///
+    /// Constructs a fresh, empty [`LayerRegistry`] internally and
+    /// discards it after the call. Use this for callers that don't
+    /// care about layer-aware widgets (e.g. headless emulators,
+    /// snapshot simulators) and want to keep the pre-v8 signature.
+    pub fn update_without_layers(
+        &mut self,
+        events: &[Event],
+        cursor: mouse::Cursor,
+        renderer: &mut Renderer,
+        messages: &mut Vec<Message>,
+    ) -> (State, Vec<event::Status>) {
+        let mut layers = LayerRegistry::new();
+        self.update(events, cursor, renderer, messages, &mut layers)
     }
 
     /// Draws the [`UserInterface`] with the provided [`Renderer`].

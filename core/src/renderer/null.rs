@@ -3,6 +3,7 @@ use crate::image::{self, Image};
 use crate::renderer::{self, Renderer};
 use crate::svg;
 use crate::text::{self, Text};
+use crate::texture_cache::TextureRecordMode;
 use crate::{
     Background, Color, Font, Pixels, Point, Rectangle, Size, TextureCache, Transformation,
 };
@@ -20,6 +21,7 @@ impl Renderer for () {
 
     fn start_recording_texture(
         &mut self,
+        _mode: TextureRecordMode,
         _cache: &TextureCache,
         _size: Size<u32>,
         _scale_factor: f32,

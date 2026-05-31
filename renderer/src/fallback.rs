@@ -1,6 +1,9 @@
 //! Compose existing renderers and create type-safe fallback strategies.
+use iced_wgpu::core::TextureRecordMode;
+
 use crate::core::font;
 use crate::core::image;
+use crate::core::layer::LayerRegistry;
 use crate::core::renderer;
 use crate::core::svg;
 use crate::core::{
@@ -65,6 +68,7 @@ where
 
     fn start_recording_texture(
         &mut self,
+        mode: TextureRecordMode,
         cache: &TextureCache,
         size: Size<u32>,
         scale_factor: f32,
@@ -72,7 +76,7 @@ where
         delegate!(
             self,
             renderer,
-            renderer.start_recording_texture(cache, size, scale_factor)
+            renderer.start_recording_texture(mode, cache, size, scale_factor)
         )
     }
 
@@ -106,6 +110,18 @@ where
 
     fn reset(&mut self, new_bounds: Rectangle) {
         delegate!(self, renderer, renderer.reset(new_bounds));
+    }
+
+    fn layer_depth(&self) -> u32 {
+        delegate!(self, renderer, renderer.layer_depth())
+    }
+
+    fn compose_layers(&mut self, registry: &LayerRegistry, debug_outline: bool) {
+        delegate!(
+            self,
+            renderer,
+            renderer.compose_layers(registry, debug_outline)
+        );
     }
 }
 

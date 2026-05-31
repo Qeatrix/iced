@@ -326,8 +326,12 @@ impl<P: Program + 'static> Emulator<P> {
                     }
                 }
 
-                let (_state, _status) =
-                    user_interface.update(&events, self.cursor, &mut self.renderer, &mut messages);
+                let (_state, _status) = user_interface.update_without_layers(
+                    &events,
+                    self.cursor,
+                    &mut self.renderer,
+                    &mut messages,
+                );
 
                 self.cache = Some(user_interface.into_cache());
 
@@ -449,7 +453,7 @@ impl<P: Program + 'static> Emulator<P> {
         );
 
         // TODO: Nested redraws!
-        let _ = user_interface.update(
+        let _ = user_interface.update_without_layers(
             &[core::Event::Window(window::Event::RedrawRequested(
                 Instant::now(),
             ))],

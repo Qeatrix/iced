@@ -7,6 +7,7 @@ pub use crate::core::window::{Event, Id, RedrawRequest, Settings};
 use crate::conversion;
 use crate::core::alignment;
 use crate::core::input_method;
+use crate::core::layer::LayerRegistry;
 use crate::core::mouse;
 use crate::core::renderer;
 use crate::core::text;
@@ -76,6 +77,7 @@ where
                 renderer,
                 mouse_interaction: mouse::Interaction::None,
                 redraw_at: None,
+                layers: LayerRegistry::new(),
                 preedit: None,
                 ime_state: None,
             },
@@ -165,6 +167,11 @@ where
     pub surface_version: u64,
     pub renderer: P::Renderer,
     pub redraw_at: Option<Instant>,
+    /// Per-frame compositor-layer registry. Cleared at the start of
+    /// every redraw cycle; populated by layer-aware widgets during
+    /// `interface.update`; consumed by `renderer.compose_layers`
+    /// between `interface.draw` and the backend's present.
+    pub layers: LayerRegistry,
     preedit: Option<Preedit<P::Renderer>>,
     ime_state: Option<(Rectangle, input_method::Purpose)>,
 }

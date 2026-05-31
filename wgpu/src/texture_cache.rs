@@ -6,6 +6,7 @@ use std::borrow::Cow;
 use std::mem;
 
 use rustc_hash::FxHashMap;
+use wgpu::naga::FastIndexMap;
 
 use crate::core::{Rectangle, Size, Transformation};
 use crate::layer;
@@ -37,6 +38,12 @@ pub struct Entry {
     pub texture_bind_group: wgpu::BindGroup,
     pub size: Size<u32>,
     pub physical_size: Size<u32>,
+    /// The actual allocated dimensions of `texture`. Grown geometrically
+    /// past `physical_size` so frequent resize doesn't churn the wgpu
+    /// allocator; the composite shader is told the content sub-region via
+    /// [`Uniforms::uv_max_and_scale`] so the over-allocated edges (which
+    /// are transparent from the cache render's clear) are not sampled.
+    pub texture_capacity_size: Size<u32>,
     pub scale_factor: f32,
 
     pub quad: crate::quad::State,
@@ -53,10 +60,10 @@ pub struct Storage {
     pub entries: FxHashMap<u64, Entry>,
     /// Recorded layer stacks awaiting a flush into their cache's texture
     /// at the start of the next frame's draw.
-    pub pending: FxHashMap<u64, layer::Stack>,
+    pub pending: FastIndexMap<u64, layer::Stack>,
     /// Stack of saved `Renderer.layers` values, paired with the cache id
-    /// that triggered the swap. Supports nested `draw_to_texture` calls.
-    pub recording_stack: Vec<(u64, layer::Stack)>,
+    /// that triggered the swap and the `keep` flag. Supports nested `draw_to_texture` calls.
+    pub recording_stack: Vec<(u64, layer::Stack, bool)>,
     /// Lazily initialized rendering pipeline for compositing caches.
     pub pipeline: Option<Pipeline>,
 }
@@ -65,7 +72,7 @@ impl Default for Storage {
     fn default() -> Self {
         Self {
             entries: FxHashMap::default(),
-            pending: FxHashMap::default(),
+            pending: FastIndexMap::default(),
             recording_stack: Vec::new(),
             pipeline: None,
         }
@@ -93,8 +100,15 @@ pub struct Pipeline {
 pub struct Uniforms {
     pub transform: [f32; 16],
     pub bounds: [f32; 4],
-    pub scale: f32,
-    pub _pad: [f32; 3],
+    /// `[uv_max.x, uv_max.y, scale, _pad]`.
+    ///
+    /// `uv_max` is the ratio of the content sub-region to the GPU texture's
+    /// allocated dimensions, in each axis — i.e. the fraction of the texture
+    /// that holds rendered content. The composite shader uses it to scale UV
+    /// sampling so a possibly over-allocated texture is sampled only where
+    /// content lives (the rest is transparent from the cache render's clear).
+    /// `[1.0, 1.0, scale, 0.0]` recovers the pre-quantization sampling.
+    pub uv_max_and_scale: [f32; 4],
 }
 
 impl Pipeline {
@@ -113,20 +127,22 @@ impl Pipeline {
         let uniform_alignment = device
             .limits()
             .min_uniform_buffer_offset_alignment
-            .max(mem::size_of::<Uniforms>() as u32) as wgpu::BufferAddress;
+            .max(mem::size_of::<Uniforms>() as u32)
+            as wgpu::BufferAddress;
 
         let constant_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("iced_wgpu.texture_cache.constant_layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    // The fragment shader now reads `uv_max_and_scale.xy` from
+                    // the same uniform to constrain sampling to the content
+                    // sub-region of an over-allocated texture.
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: true,
-                        min_binding_size: wgpu::BufferSize::new(
-                            mem::size_of::<Uniforms>() as u64,
-                        ),
+                        min_binding_size: wgpu::BufferSize::new(mem::size_of::<Uniforms>() as u64),
                     },
                     count: None,
                 },
@@ -263,12 +279,7 @@ impl LayerState {
     }
 
     /// Ensures the uniform buffer is large enough for `count` instances.
-    pub fn ensure_capacity(
-        &mut self,
-        device: &wgpu::Device,
-        pipeline: &Pipeline,
-        count: u32,
-    ) {
+    pub fn ensure_capacity(&mut self, device: &wgpu::Device, pipeline: &Pipeline, count: u32) {
         if count == 0 {
             return;
         }
@@ -320,6 +331,7 @@ impl LayerState {
         instance: &Instance,
         projection: Transformation,
         scale: f32,
+        uv_max: [f32; 2],
     ) {
         let buffer = self
             .uniform_buffer
@@ -336,8 +348,7 @@ impl LayerState {
                 instance.bounds.width,
                 instance.bounds.height,
             ],
-            scale,
-            _pad: [0.0; 3],
+            uv_max_and_scale: [uv_max[0], uv_max[1], scale, 0.0],
         };
 
         let bytes = bytemuck::bytes_of(&uniforms);

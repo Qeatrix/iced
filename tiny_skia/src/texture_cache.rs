@@ -19,8 +19,8 @@ pub struct Entry {
 #[derive(Default)]
 pub struct Storage {
     pub entries: FxHashMap<u64, Entry>,
-    pub pending: FxHashMap<u64, layer::Stack>,
-    pub recording_stack: Vec<(u64, layer::Stack)>,
+    pub pending: Vec<(u64, layer::Stack)>,
+    pub recording_stack: Vec<(u64, layer::Stack, bool)>,
 }
 
 impl Storage {

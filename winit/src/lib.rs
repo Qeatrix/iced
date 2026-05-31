@@ -19,6 +19,7 @@
 )]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 pub use iced_debug as debug;
+use iced_debug::core::layer::DEBUG_LAYERS;
 pub use iced_program as program;
 pub use iced_runtime as runtime;
 pub use program::core;
@@ -789,6 +790,12 @@ async fn run_instance<P>(
                         let interact_span = debug::interact(id);
                         let mut redraw_count = 0;
 
+                        // Reset the per-frame compositor-layer registry
+                        // before draining the redraw `update` loop. Layer-
+                        // aware widgets (e.g. `Cached` in `Layer` mode) re-
+                        // register their slots from this frame's update.
+                        window.layers.clear();
+
                         let state = loop {
                             let message_count = messages.len();
                             let (state, _) = interface.update(
@@ -796,6 +803,7 @@ async fn run_instance<P>(
                                 cursor,
                                 &mut window.renderer,
                                 &mut messages,
+                                &mut window.layers,
                             );
 
                             if message_count == messages.len() && !state.has_layout_changed() {
@@ -903,6 +911,13 @@ async fn run_instance<P>(
                             },
                             cursor,
                         );
+                        // Composite registered compositor layers into the
+                        // renderer's layer stack. Emits quads alongside the
+                        // widget-tree primitives so the backend dispatches
+                        // them in the same GPU pass below.
+                        window
+                            .renderer
+                            .compose_layers(&window.layers, *DEBUG_LAYERS);
                         draw_span.finish();
 
                         if let user_interface::State::Updated {
@@ -1091,6 +1106,7 @@ async fn run_instance<P>(
                                     window.state.cursor(),
                                     &mut window.renderer,
                                     &mut messages,
+                                    &mut window.layers,
                                 );
 
                             #[cfg(feature = "unconditional-rendering")]

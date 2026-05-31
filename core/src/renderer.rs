@@ -3,6 +3,8 @@
 mod null;
 
 use crate::image;
+use crate::layer::LayerRegistry;
+use crate::texture_cache::TextureRecordMode;
 use crate::{
     Background, Border, Color, Font, Pixels, Rectangle, Shadow, Size, TextureCache, Transformation,
     Vector,
@@ -71,6 +73,7 @@ pub trait Renderer {
     /// [`draw_to_texture`]: Self::draw_to_texture
     fn start_recording_texture(
         &mut self,
+        mode: TextureRecordMode,
         cache: &TextureCache,
         size: Size<u32>,
         scale_factor: f32,
@@ -92,12 +95,13 @@ pub trait Renderer {
     /// [`draw_cached_texture`]: Self::draw_cached_texture
     fn draw_to_texture(
         &mut self,
+        mode: TextureRecordMode,
         cache: &TextureCache,
         size: Size<u32>,
         scale_factor: f32,
         f: impl FnOnce(&mut Self),
     ) {
-        if self.start_recording_texture(cache, size, scale_factor) {
+        if self.start_recording_texture(mode, cache, size, scale_factor) {
             f(self);
             self.end_recording_texture();
         }
@@ -144,6 +148,37 @@ pub trait Renderer {
     ///
     /// By default, it does nothing.
     fn tick(&mut self) {}
+
+    /// Reports the current backend texture-recording depth.
+    ///
+    /// Provided as a hook for custom animation widgets that want to
+    /// branch on whether they're being recorded into a parent cache
+    /// (and therefore should defer compositing); not used by the
+    /// standard `Cached` implementation, which relies on
+    /// [`compose_layers`] for nested-animation correctness.
+    ///
+    /// The default implementation returns `0`.
+    ///
+    /// [`compose_layers`]: Self::compose_layers
+    fn layer_depth(&self) -> u32 {
+        0
+    }
+
+    /// Composites every registered slot in `registry` into the
+    /// renderer's current layer stack.
+    ///
+    /// Called by the runtime between [`UserInterface::draw`] and the
+    /// backend's `draw`, so the composite quads are emitted alongside
+    /// the widget-tree primitives and dispatched in the same GPU pass.
+    ///
+    /// The default implementation is a no-op, so renderers without
+    /// layer support degrade silently to source-order rendering.
+    ///
+    /// [`UserInterface::draw`]: crate::user_interface::UserInterface::draw
+    fn compose_layers(&mut self, registry: &LayerRegistry, debug_outline: bool) {
+        let _ = registry;
+        let _ = debug_outline;
+    }
 }
 
 /// A polygon with four sides.

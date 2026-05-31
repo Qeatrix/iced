@@ -7,6 +7,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Defines recording mode:
+/// Only traverse in layer stack or rerecord full layer stack
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextureRecordMode {
+    /// Rerecord entire stack
+    Flush,
+    /// Traverses in layer stack without rerecording texture
+    TraverseOnly,
+}
+
 /// A handle to a persistent backing-store (texture for GPU backends, pixmap
 /// for CPU backends) that a widget can render its expensive contents into
 /// once and then animate cheaply by replaying it under different
