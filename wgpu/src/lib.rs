@@ -493,7 +493,11 @@ impl Renderer {
         let mut quad_layer = 0;
         let mut mesh_layer = 0;
         let mut text_layer = 0;
-        let mut cached_texture_layer = 0;
+        // Seed from the frame-level running index: cached-texture layer states
+        // are shared across the per-cache flush passes and the main pass (not
+        // swapped like quad/text state), so this index must continue across
+        // every `render` call in the frame to stay aligned with `prepare`.
+        let mut cached_texture_layer = self.texture_cache_state.render_layer;
 
         #[cfg(any(feature = "svg", feature = "image"))]
         let mut image_layer = 0;
@@ -714,6 +718,11 @@ impl Renderer {
         }
 
         let _ = ManuallyDrop::into_inner(render_pass);
+
+        // Persist the running index so the next `render` call this frame (the
+        // main pass after cache flushes, or the next cache) keeps consuming
+        // layer states in lockstep with `prepare`.
+        self.texture_cache_state.render_layer = cached_texture_layer;
 
         debug::layers_rendered(|| {
             self.layers

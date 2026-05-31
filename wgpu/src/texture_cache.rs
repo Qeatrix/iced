@@ -210,7 +210,22 @@ impl Pipeline {
 #[derive(Default)]
 pub struct FrameState {
     pub layers: Vec<LayerState>,
+    /// Running index assigned to each cached-texture layer during `prepare`.
+    /// Accumulates across every `prepare` call in a frame (the per-cache
+    /// flushes plus the main pass) because the layer states are shared, not
+    /// swapped per cache. `render` must consume the same running index via
+    /// [`render_layer`] so a layer reads back the uniform state that was
+    /// written for it.
+    ///
+    /// [`render_layer`]: Self::render_layer
     pub prepare_layer: usize,
+    /// Running index consumed by `render`, kept in lockstep with
+    /// [`prepare_layer`]. Persisted on `FrameState` (not a `render`-local)
+    /// so it continues across the multiple `render` calls a single frame
+    /// makes while flushing nested caches.
+    ///
+    /// [`prepare_layer`]: Self::prepare_layer
+    pub render_layer: usize,
 }
 
 impl FrameState {
@@ -220,6 +235,7 @@ impl FrameState {
 
     pub fn trim(&mut self) {
         self.prepare_layer = 0;
+        self.render_layer = 0;
     }
 }
 
