@@ -308,7 +308,7 @@ where
         viewport: &Rectangle,
     ) {
         let mut local_messages = Vec::new();
-        let mut local_shell = Shell::new(&mut local_messages);
+        let mut local_shell = Shell::with_layers(&mut local_messages, shell.layers_ref());
 
         let t = tree.state.downcast_mut::<Rc<RefCell<Option<Tree>>>>();
         self.with_element_mut(|element| {
@@ -584,7 +584,7 @@ where
         shell: &mut Shell<'_, Message>,
     ) {
         let mut local_messages = Vec::new();
-        let mut local_shell = Shell::new(&mut local_messages);
+        let mut local_shell = Shell::with_layers(&mut local_messages, shell.layers_ref());
 
         let _ = self.with_overlay_mut_maybe(|overlay| {
             overlay.update(event, layout, cursor, renderer, &mut local_shell);

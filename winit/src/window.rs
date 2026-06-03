@@ -21,6 +21,7 @@ use crate::runtime::window::raw_window_handle;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::monitor::MonitorHandle;
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -77,7 +78,7 @@ where
                 renderer,
                 mouse_interaction: mouse::Interaction::None,
                 redraw_at: None,
-                layers: LayerRegistry::new(),
+                layers: RefCell::new(LayerRegistry::new()),
                 preedit: None,
                 ime_state: None,
             },
@@ -171,7 +172,7 @@ where
     /// every redraw cycle; populated by layer-aware widgets during
     /// `interface.update`; consumed by `renderer.compose_layers`
     /// between `interface.draw` and the backend's present.
-    pub layers: LayerRegistry,
+    pub layers: RefCell<LayerRegistry>,
     preedit: Option<Preedit<P::Renderer>>,
     ime_state: Option<(Rectangle, input_method::Purpose)>,
 }

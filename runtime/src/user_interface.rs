@@ -1,4 +1,6 @@
 //! Implement your own event loop to drive a user interface.
+use std::cell::RefCell;
+
 use crate::core::event::{self, Event};
 use crate::core::layer::LayerRegistry;
 use crate::core::layout;
@@ -120,6 +122,12 @@ where
     /// It returns __messages__ that may have been produced as a result of user
     /// interactions. You should feed these to your __update logic__.
     ///
+    /// `layers` is a shared [`LayerRegistry`] that layer-aware widgets (e.g.
+    /// `Cached` in `Layer` mode) use to register compositor slots during the
+    /// update walk. The registry must be cleared between frames by the caller.
+    /// If you don't need compositor layers, use
+    /// [`update_without_layers`](Self::update_without_layers) instead.
+    ///
     /// # Example
     /// Let's allow our [counter](index.html#usage) to change state by
     /// completing [the previous example](#example):
@@ -136,6 +144,8 @@ where
     /// #     pub fn view(&self) -> iced_core::Element<(), (), Renderer> { unimplemented!() }
     /// #     pub fn update(&mut self, _: ()) {}
     /// # }
+    /// use std::cell::RefCell;
+    /// use iced_runtime::core::layer::LayerRegistry;
     /// use iced_runtime::core::mouse;
     /// use iced_runtime::core::Size;
     /// use iced_runtime::user_interface::{self, UserInterface};
@@ -150,9 +160,11 @@ where
     /// // Initialize our event storage
     /// let mut events = Vec::new();
     /// let mut messages = Vec::new();
+    /// let layers = RefCell::new(LayerRegistry::new());
     ///
     /// loop {
     ///     // Obtain system events...
+    ///     layers.borrow_mut().clear();
     ///
     ///     let mut user_interface = UserInterface::build(
     ///         counter.view(),
@@ -166,7 +178,8 @@ where
     ///         &events,
     ///         cursor,
     ///         &mut renderer,
-    ///         &mut messages
+    ///         &mut messages,
+    ///         &layers,
     ///     );
     ///
     ///     cache = user_interface.into_cache();
@@ -183,7 +196,7 @@ where
         cursor: mouse::Cursor,
         renderer: &mut Renderer,
         messages: &mut Vec<Message>,
-        layers: &mut LayerRegistry,
+        layers: &RefCell<LayerRegistry>,
     ) -> (State, Vec<event::Status>) {
         let mut outdated = false;
         let mut redraw_request = window::RedrawRequest::Wait;
@@ -406,8 +419,8 @@ where
         renderer: &mut Renderer,
         messages: &mut Vec<Message>,
     ) -> (State, Vec<event::Status>) {
-        let mut layers = LayerRegistry::new();
-        self.update(events, cursor, renderer, messages, &mut layers)
+        let layers = RefCell::new(LayerRegistry::new());
+        self.update(events, cursor, renderer, messages, &layers)
     }
 
     /// Draws the [`UserInterface`] with the provided [`Renderer`].

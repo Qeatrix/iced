@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use crate::clipboard;
@@ -21,7 +22,7 @@ pub struct Shell<'a, Message> {
     is_layout_invalid: bool,
     are_widgets_invalid: bool,
     clipboard: Clipboard,
-    layers: Option<&'a mut LayerRegistry>,
+    layers: Option<&'a RefCell<LayerRegistry>>,
 }
 
 impl<'a, Message> Shell<'a, Message> {
@@ -48,7 +49,7 @@ impl<'a, Message> Shell<'a, Message> {
     /// [`layer_stack_ancestors`]: Self::layer_stack_ancestors
     pub fn with_layers(
         messages: &'a mut Vec<Message>,
-        layers: Option<&'a mut LayerRegistry>,
+        layers: Option<&'a RefCell<LayerRegistry>>,
     ) -> Self {
         Self {
             messages,
@@ -221,7 +222,9 @@ impl<'a, Message> Shell<'a, Message> {
     /// No-op if the shell was constructed via [`Shell::new`] (i.e.
     /// without a layer registry).
     pub fn register_layer(&mut self, slot: Arc<LayerSlot>) {
-        if let Some(layers) = self.layers.as_deref_mut() {
+        if let Some(reg) = self.layers {
+            let mut layers = reg.borrow_mut();
+
             if layers.registered_ids.insert(slot.id()) {
                 layers.registered.push(slot);
             }
@@ -237,7 +240,8 @@ impl<'a, Message> Shell<'a, Message> {
     /// [`current_layer`]: Self::current_layer
     /// [`pop_layer`]: Self::pop_layer
     pub fn push_layer(&mut self, slot: &Arc<LayerSlot>) {
-        if let Some(layers) = self.layers.as_deref_mut() {
+        if let Some(reg) = self.layers {
+            let mut layers = reg.borrow_mut();
             layers.stack.push(slot.clone());
         }
     }
@@ -250,27 +254,52 @@ impl<'a, Message> Shell<'a, Message> {
     ///
     /// [`push_layer`]: Self::push_layer
     pub fn pop_layer(&mut self) {
-        if let Some(layers) = self.layers.as_deref_mut() {
+        if let Some(reg) = self.layers {
+            let mut layers = reg.borrow_mut();
             let _ = layers.stack.pop();
         }
     }
 
-    /// Returns the topmost slot on the parent-tracking stack, or
+    /// Returns a clone of the topmost slot's handle on the parent-tracking stack, or
     /// [`None`] if the stack is empty (top-level layer) or the shell
     /// has no layer registry.
-    pub fn current_layer(&self) -> Option<&Arc<LayerSlot>> {
-        self.layers.as_deref().and_then(|l| l.stack.last())
+    pub fn current_layer(&self) -> Option<Arc<LayerSlot>> {
+        self.layers
+            .and_then(|reg| reg.borrow().stack.last().cloned())
     }
 
-    /// Iterates over the layer stack from the immediate parent at the
-    /// top down to the outermost layer at the bottom. Useful for
-    /// cache-coupling: an `O(depth)` upward walk lets a widget
-    /// invalidate every ancestor layer when its own cache becomes
-    /// stale.
-    pub fn layer_stack_ancestors(&self) -> impl DoubleEndedIterator<Item = &Arc<LayerSlot>> {
+    /// Returns the layer stack's slots as owned [`Arc`] clones,
+    /// ordered from the immediate parent (first) down to the
+    /// outermost layer (last). Empty if the shell has no registry.
+    ///
+    /// A snapshot of cloned handles rather than borrows: the registry
+    /// lives behind a `RefCell` and cannot lend out references that
+    /// outlive the access. Useful for cache-coupling — an `O(depth)`
+    /// walk lets a widget mark every ancestor layer dirty when its
+    /// own cache goes stale.
+    pub fn layer_stack_ancestors(&self) -> Vec<Arc<LayerSlot>> {
         self.layers
-            .as_deref()
-            .into_iter()
-            .flat_map(|l| l.stack.iter().rev())
+            .map(|reg| reg.borrow().stack.iter().rev().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Returns this shell's [`LayerRegistry`] as a shared reference,
+    /// or [`None`] if the shell has none.
+    ///
+    /// Used to thread the registry into a child shell across a
+    /// message-mapping boundary (e.g. [`Element::map`]) so a
+    /// layer-aware widget behind it can still
+    /// [`register_layer`]/[`push_layer`].
+    ///
+    /// The `'a` in the return type is deliberate: it ties the borrow
+    /// to the registry's own lifetime, not to `&self`. That lets a
+    /// caller hold the returned reference and still call `&mut`
+    /// methods (e.g. [`merge`](Self::merge)) on this shell.
+    ///
+    /// [`Element::map`]: crate::Element::map
+    /// [`register_layer`]: Self::register_layer
+    /// [`push_layer`]: Self::push_layer
+    pub fn layers_ref(&self) -> Option<&'a RefCell<LayerRegistry>> {
+        self.layers
     }
 }

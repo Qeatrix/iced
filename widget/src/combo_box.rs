@@ -562,7 +562,7 @@ where
 
         // Create a new list of local messages
         let mut local_messages = Vec::new();
-        let mut local_shell = Shell::new(&mut local_messages);
+        let mut local_shell = Shell::with_layers(&mut local_messages, shell.layers_ref());
 
         // Provide it to the widget
         self.text_input.update(
@@ -718,7 +718,7 @@ where
 
                 // Unfocus the input
                 let mut local_messages = Vec::new();
-                let mut local_shell = Shell::new(&mut local_messages);
+                let mut local_shell = Shell::with_layers(&mut local_messages, shell.layers_ref());
                 self.text_input.update(
                     &mut tree.children[0],
                     &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),

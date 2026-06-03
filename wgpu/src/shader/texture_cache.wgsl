@@ -41,84 +41,102 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
     return out;
 }
 
-// Catmull-Rom cubic weight (B = 0, C = 1/2): an interpolating reconstruction
-// kernel (it passes through the source texels, so it is exact at integer phase)
-// with a mild high-frequency boost. At fractional sub-pixel phases it keeps
-// moving edges sharper than hardware bilinear — and sharper than the smoother
-// Mitchell (B = C = 1/3) we used before, whose approximating center weight
-// softened text during a translate. The negative lobes can ring slightly on
-// mid-tone edges; on high-contrast (near black-on-white) text the overshoot is
-// clamped away.
-fn cubic_weight(x_in: f32) -> f32 {
-    let b = 0.0;
-    let c = 0.5;
-    let x = abs(x_in);
-    let x2 = x * x;
-    let x3 = x2 * x;
-    if (x < 1.0) {
-        return ((12.0 - 9.0 * b - 6.0 * c) * x3
-              + (-18.0 + 12.0 * b + 6.0 * c) * x2
-              + (6.0 - 2.0 * b)) / 6.0;
-    } else if (x < 2.0) {
-        return ((-b - 6.0 * c) * x3
-              + (6.0 * b + 30.0 * c) * x2
-              + (-12.0 * b - 48.0 * c) * x
-              + (8.0 * b + 24.0 * c)) / 6.0;
-    }
-    return 0.0;
+// Sample a texel center (UV already normalized to the full texture).
+// `textureSampleLevel` (explicit LOD) is mandatory: it is the only sampling
+// form allowed inside the non-uniform control flow we use below.
+fn samp(uv: vec2<f32>) -> vec4<f32> {
+    return textureSampleLevel(u_texture, u_sampler, uv, 0.0);
 }
 
+// Catmull-Rom reconstruction (B = 0, C = 1/2): an *interpolating* kernel that
+// passes through the source texels (exact at integer phase) with a mild
+// high-frequency boost, keeping moving edges and text sharp during a sub-pixel
+// translate — sharper than hardware bilinear and far sharper than a smoothing
+// B-spline.
+//
+// A naive Catmull-Rom is 4x4 = 16 point samples per pixel. Instead we exploit
+// the hardware *linear* sampler (already configured Linear/Linear): the central
+// positive weight pair (w1, w2) of each axis is folded into a single bilinear
+// fetch at a fractional offset, so the full 2D kernel costs only 3x3 = 9
+// fetches — bit-for-bit the same result. The kernel is separable, so when one
+// axis is at integer phase (e.g. the vertical axis during a horizontal slide)
+// that axis collapses to its center row/column and the cost drops to 3 fetches.
+// For a settled/snapped position both axes collapse and a single fetch is exact.
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let dims = vec2<f32>(textureDimensions(u_texture));
-    // Effective content dimensions inside the (possibly over-allocated)
-    // texture. `uv_max == 1` recovers the pre-quantization sampling where
-    // the content fills the whole texture.
+    // Effective content dimensions inside the (possibly over-allocated) texture.
     let content_dims = dims * u.uv_max_and_scale.xy;
-    // Continuous texel coordinate (texel centers at integers), scaled so
-    // quad-UV [0,1] traverses exactly the content sub-region rather than
-    // the full texture.
+
+    // Continuous texel coordinate; texel centers sit at integers.
     let coord = in.uv * content_dims - vec2<f32>(0.5);
-
-    // When the cache lands exactly on the device-pixel grid (e.g. the widget
-    // snapped a static transform), one texel maps to one device pixel: sample it
-    // directly. This is a pure optimization — Catmull-Rom is already exact at
-    // integer phase, so the 16-tap path below returns the same texel — it just
-    // skips the loop for the common snapped/at-rest case.
-    let nearest = round(coord);
-    let frac = coord - nearest;
-    if (max(abs(frac.x), abs(frac.y)) < 0.01) {
-        let suv = (nearest + vec2<f32>(0.5)) / dims;
-        return textureSampleLevel(u_texture, u_sampler, suv, 0.0);
-    }
-
-    // Otherwise (mid-animation, fractional offset) reconstruct with a 4x4
-    // Catmull-Rom bicubic: sharp resampling of the moving edges.
     let base = floor(coord);
     let f = coord - base;
-    let wx = vec4<f32>(
-        cubic_weight(f.x + 1.0),
-        cubic_weight(f.x),
-        cubic_weight(f.x - 1.0),
-        cubic_weight(f.x - 2.0),
-    );
-    let wy = vec4<f32>(
-        cubic_weight(f.y + 1.0),
-        cubic_weight(f.y),
-        cubic_weight(f.y - 1.0),
-        cubic_weight(f.y - 2.0),
-    );
 
-    var color = vec4<f32>(0.0);
-    var wsum = 0.0;
-    for (var j = 0; j < 4; j = j + 1) {
-        for (var i = 0; i < 4; i = i + 1) {
-            let texel = base + vec2<f32>(f32(i) - 1.0, f32(j) - 1.0);
-            let suv = (texel + vec2<f32>(0.5)) / dims;
-            let w = wx[i] * wy[j];
-            color = color + textureSampleLevel(u_texture, u_sampler, suv, 0.0) * w;
-            wsum = wsum + w;
-        }
+    // Per-axis integer-phase test (texel grid aligned to device pixels).
+    let near_x = f.x < 0.01 || f.x > 0.99;
+    let near_y = f.y < 0.01 || f.y > 0.99;
+
+    // Fully snapped / at rest: one texel maps to one device pixel — a single
+    // tap is exact and skips all reconstruction work.
+    if (near_x && near_y) {
+        let nearest = round(coord);
+        return samp((nearest + vec2<f32>(0.5)) / dims);
     }
-    return color / wsum;
+
+    // Catmull-Rom weights per axis. Sum over the four taps is 1 on each axis
+    // (partition of unity), so no normalization is needed afterwards.
+    let w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    let w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    let w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    let w3 = f * f * (-0.5 + 0.5 * f);
+
+    // Fold the central positive pair into one hardware-bilinear fetch.
+    let w12 = w1 + w2;
+    let offset12 = w2 / w12;
+
+    // Texel-center coordinates (in texels) for the three columns/rows, clamped
+    // to the content region so the outer taps never read the transparent
+    // over-allocated border (which would fringe the sliding page edge).
+    let lo = vec2<f32>(0.5);
+    let hi = content_dims - vec2<f32>(0.5);
+
+    let c0 = clamp(base - 0.5, lo, hi);              // texel base-1 center
+    let c12 = clamp(base + offset12 + 0.5, lo, hi);  // bilinear-blended pair
+    let c3 = clamp(base + 2.5, lo, hi);              // texel base+2 center
+
+    // Separable collapse: skip an axis that is at integer phase.
+    if (near_y) {
+        // Horizontal slide: only the central row contributes (w0.y, w3.y ~ 0).
+        let y = c12.y / dims.y;
+        return samp(vec2<f32>(c0.x / dims.x, y)) * w0.x
+             + samp(vec2<f32>(c12.x / dims.x, y)) * w12.x
+             + samp(vec2<f32>(c3.x / dims.x, y)) * w3.x;
+    }
+    if (near_x) {
+        // Vertical slide: only the central column contributes.
+        let x = c12.x / dims.x;
+        return samp(vec2<f32>(x, c0.y / dims.y)) * w0.y
+             + samp(vec2<f32>(x, c12.y / dims.y)) * w12.y
+             + samp(vec2<f32>(x, c3.y / dims.y)) * w3.y;
+    }
+
+    // General 2D (diagonal / scaled) motion: full 9-tap Catmull-Rom.
+    let ux0 = c0.x / dims.x;
+    let ux1 = c12.x / dims.x;
+    let ux2 = c3.x / dims.x;
+    let uy0 = c0.y / dims.y;
+    let uy1 = c12.y / dims.y;
+    let uy2 = c3.y / dims.y;
+
+    var color = samp(vec2<f32>(ux0, uy0)) * (w0.x * w0.y);
+    color = color + samp(vec2<f32>(ux1, uy0)) * (w12.x * w0.y);
+    color = color + samp(vec2<f32>(ux2, uy0)) * (w3.x * w0.y);
+    color = color + samp(vec2<f32>(ux0, uy1)) * (w0.x * w12.y);
+    color = color + samp(vec2<f32>(ux1, uy1)) * (w12.x * w12.y);
+    color = color + samp(vec2<f32>(ux2, uy1)) * (w3.x * w12.y);
+    color = color + samp(vec2<f32>(ux0, uy2)) * (w0.x * w3.y);
+    color = color + samp(vec2<f32>(ux1, uy2)) * (w12.x * w3.y);
+    color = color + samp(vec2<f32>(ux2, uy2)) * (w3.x * w3.y);
+    return color;
 }

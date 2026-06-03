@@ -84,7 +84,7 @@ where
         shell: &mut Shell<'_, B>,
     ) {
         let mut local_messages = Vec::new();
-        let mut local_shell = Shell::new(&mut local_messages);
+        let mut local_shell = Shell::with_layers(&mut local_messages, shell.layers_ref());
 
         self.content
             .update(event, layout, cursor, renderer, &mut local_shell);

@@ -794,7 +794,7 @@ async fn run_instance<P>(
                         // before draining the redraw `update` loop. Layer-
                         // aware widgets (e.g. `Cached` in `Layer` mode) re-
                         // register their slots from this frame's update.
-                        window.layers.clear();
+                        window.layers.get_mut().clear();
 
                         let state = loop {
                             let message_count = messages.len();
@@ -911,13 +911,14 @@ async fn run_instance<P>(
                             },
                             cursor,
                         );
+
                         // Composite registered compositor layers into the
                         // renderer's layer stack. Emits quads alongside the
                         // widget-tree primitives so the backend dispatches
                         // them in the same GPU pass below.
-                        window
-                            .renderer
-                            .compose_layers(&window.layers, *DEBUG_LAYERS);
+                        let registry = window.layers.get_mut();
+                        window.renderer.compose_layers(&registry, *DEBUG_LAYERS);
+
                         draw_span.finish();
 
                         if let user_interface::State::Updated {
