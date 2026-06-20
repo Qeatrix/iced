@@ -3,6 +3,8 @@
 //! Each cached widget renders into its own [`tiny_skia::Pixmap`]; the main
 //! `draw()` pass blits the pixmap into the frame's [`tiny_skia::PixmapMut`]
 //! honoring the recording-time [`Transformation`].
+use std::sync::Weak;
+
 use rustc_hash::FxHashMap;
 use tiny_skia;
 
@@ -14,6 +16,7 @@ pub struct Entry {
     pub size: Size<u32>,
     pub physical_size: Size<u32>,
     pub scale_factor: f32,
+    pub liveness: Weak<()>,
 }
 
 #[derive(Default)]

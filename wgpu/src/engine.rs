@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 #[derive(Clone)]
 pub struct Engine {
     pub(crate) device: wgpu::Device,
+    pub(crate) device_type: wgpu::DeviceType,
     pub(crate) queue: wgpu::Queue,
     pub(crate) format: wgpu::TextureFormat,
 
@@ -23,13 +24,15 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(
-        _adapter: &wgpu::Adapter,
+        adapter: &wgpu::Adapter,
         device: wgpu::Device,
         queue: wgpu::Queue,
         format: wgpu::TextureFormat,
         antialiasing: Option<Antialiasing>, // TODO: Initialize AA pipelines lazily
         shell: Shell,
     ) -> Self {
+        let adapter_into = adapter.get_info();
+
         Self {
             format,
 
@@ -39,7 +42,7 @@ impl Engine {
 
             #[cfg(any(feature = "image", feature = "svg"))]
             image_pipeline: {
-                let backend = _adapter.get_info().backend;
+                let backend = adapter_into.backend;
 
                 crate::image::Pipeline::new(&device, format, backend)
             },
@@ -47,6 +50,7 @@ impl Engine {
             primitive_storage: Arc::new(RwLock::new(primitive::Storage::default())),
 
             device,
+            device_type: adapter_into.device_type,
             queue,
             _shell: shell,
         }

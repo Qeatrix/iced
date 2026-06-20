@@ -4,10 +4,12 @@
 //! See [`core::TextureCache`] for the public widget-facing handle.
 use std::borrow::Cow;
 use std::mem;
+use std::sync::Weak;
 
 use rustc_hash::FxHashMap;
 use wgpu::naga::FastIndexMap;
 
+use crate::core::renderer::FilterQuality;
 use crate::core::{Rectangle, Size, Transformation};
 use crate::layer;
 
@@ -45,6 +47,7 @@ pub struct Entry {
     /// are transparent from the cache render's clear) are not sampled.
     pub texture_capacity_size: Size<u32>,
     pub scale_factor: f32,
+    pub liveness: Weak<()>,
 
     pub quad: crate::quad::State,
     pub triangle: crate::triangle::State,
@@ -109,6 +112,31 @@ pub struct Uniforms {
     /// content lives (the rest is transparent from the cache render's clear).
     /// `[1.0, 1.0, scale, 0.0]` recovers the pre-quantization sampling.
     pub uv_max_and_scale: [f32; 4],
+}
+
+/// Picks a default [`FilterQuality`] for the given GPU.
+///
+/// This is the only place that maps hardware to a tier, because it is the only
+/// layer that knows [`wgpu::DeviceType`]. Used when
+/// [`renderer::Settings::filter_quality`] is left as `None`:
+///
+/// - [`DiscreteGpu`] → [`CatmullRom`]: has headroom for the sharpest filter.
+/// - [`IntegratedGpu`] → [`Bilinear`]: cheaper single tap, slight blur in
+///   motion — the composite would otherwise be a real fraction of the frame.
+/// - everything else (software, virtual, unknown) → [`Snap`]: cheapest path,
+///   since a fragment-heavy filter would hurt most exactly here.
+///
+/// [`DiscreteGpu`]: wgpu::DeviceType::DiscreteGpu
+/// [`IntegratedGpu`]: wgpu::DeviceType::IntegratedGpu
+/// [`CatmullRom`]: FilterQuality::CatmullRom
+/// [`Bilinear`]: FilterQuality::Bilinear
+/// [`Snap`]: FilterQuality::Snap
+pub fn auto_filter_quality(device_type: wgpu::DeviceType) -> FilterQuality {
+    match device_type {
+        wgpu::DeviceType::DiscreteGpu => FilterQuality::CatmullRom,
+        wgpu::DeviceType::IntegratedGpu => FilterQuality::Bilinear,
+        _ => FilterQuality::Snap,
+    }
 }
 
 impl Pipeline {
@@ -332,6 +360,7 @@ impl LayerState {
         projection: Transformation,
         scale: f32,
         uv_max: [f32; 2],
+        quality: FilterQuality,
     ) {
         let buffer = self
             .uniform_buffer
@@ -340,15 +369,16 @@ impl LayerState {
 
         let offset = pipeline.uniform_alignment * index as u64;
 
+        let mut bounds = instance.bounds;
+        if quality.snaps() {
+            bounds.x = (bounds.x * scale).round() / scale;
+            bounds.y = (bounds.y * scale).round() / scale;
+        }
+
         let uniforms = Uniforms {
             transform: *projection.as_ref(),
-            bounds: [
-                instance.bounds.x,
-                instance.bounds.y,
-                instance.bounds.width,
-                instance.bounds.height,
-            ],
-            uv_max_and_scale: [uv_max[0], uv_max[1], scale, 0.0],
+            bounds: [bounds.x, bounds.y, bounds.width, bounds.height],
+            uv_max_and_scale: [uv_max[0], uv_max[1], scale, quality.shader_mode()],
         };
 
         let bytes = bytemuck::bytes_of(&uniforms);

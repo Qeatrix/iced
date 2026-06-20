@@ -143,6 +143,9 @@ impl Renderer {
             &self.texture_cache.entries,
         );
 
+        self.texture_cache
+            .entries
+            .retain(|_id, entry| entry.liveness.upgrade().is_some());
         self.engine.trim();
     }
 
@@ -489,6 +492,7 @@ impl core::Renderer for Renderer {
                         size,
                         physical_size,
                         scale_factor,
+                        liveness: cache.liveness(),
                     },
                 );
             } else if let Some(entry) = self.texture_cache.entries.get_mut(&id) {

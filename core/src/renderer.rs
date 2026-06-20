@@ -247,6 +247,55 @@ pub trait Headless {
     ) -> Vec<u8>;
 }
 
+/// The reconstruction filter used when compositing a cached texture under a
+/// sub-pixel [`Transformation`]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FilterQuality {
+    /// Catmull-Rom bicubic - the sharpest filter.
+    /// Costs up to 9 hardware-bilinear taps per pixel
+    /// (3 for an axil-aligned slide). Keeps moving text
+    /// and edges crisp.
+    #[default]
+    CatmullRom,
+
+    /// A single hardware-bilinear tap - the cheapest filter
+    /// that still moves smoothly. Softens edges slightly *while in motion*,
+    /// sharp at rest.
+    Bilinear,
+
+    /// No reconstruction at all - the composite origin is rounded to whole
+    /// device pixels so there is never a sub-pixel offset to filter.
+    /// Always crisp, but motion steps by whole pixels instead of gliding.
+    Snap,
+}
+
+impl FilterQuality {
+    /// The kernel selector handed to the composite fragment shader.
+    /// [`CatmullRom`] takes the bicubic path; the cheaper tiers take
+    /// the single-tap path. [`Snap`] shares the single-tap value because
+    /// its crispness comes from [`Self::snaps`] rounding
+    /// the *geometry*, not from the shader.
+    ///
+    /// [`CatmullRom`]: Self::CatmullRom
+    /// [`Snap`]: Self::Snap
+    pub fn shader_mode(self) -> f32 {
+        match self {
+            FilterQuality::CatmullRom => 0.0,
+            FilterQuality::Bilinear => 1.0,
+            FilterQuality::Snap => 1.0,
+        }
+    }
+
+    /// Whether the composite quad's origin should be rounded to whole device
+    /// pixels before submission. Only [`Snap`] does this; it is what removes
+    /// the sub-pixel offset — and therefore the need to filter at all.
+    ///
+    /// [`Snap`]: Self::Snap
+    pub fn snaps(self) -> bool {
+        matches!(self, FilterQuality::Snap)
+    }
+}
+
 /// The settings of a [`Renderer`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settings {
@@ -257,6 +306,12 @@ pub struct Settings {
     ///
     /// By default, it will be set to `16.0`.
     pub default_text_size: Pixels,
+
+    /// The reconstruction filter for compositing cached textures.
+    ///
+    /// `None` (the default) auto-selects a tier from the GPU type at startup.
+    /// `Some` forces a specific [`FilterQuality`] regardless of hardware.
+    pub filter_quality: Option<FilterQuality>,
 }
 
 impl Default for Settings {
@@ -264,6 +319,7 @@ impl Default for Settings {
         Self {
             default_font: Font::DEFAULT,
             default_text_size: Pixels(16.0),
+            filter_quality: None,
         }
     }
 }

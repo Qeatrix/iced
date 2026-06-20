@@ -68,6 +68,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Effective content dimensions inside the (possibly over-allocated) texture.
     let content_dims = dims * u.uv_max_and_scale.xy;
 
+    let mode = u.uv_max_and_scale.w;
+    if (mode > 0.5) {
+    	let coord = clamp(in.uv * content_dims, vec2<f32>(0.5), content_dims - vec2<f32>(0.5));
+     	return samp(coord / dims);
+    }
+
     // Continuous texel coordinate; texel centers sit at integers.
     let coord = in.uv * content_dims - vec2<f32>(0.5);
     let base = floor(coord);

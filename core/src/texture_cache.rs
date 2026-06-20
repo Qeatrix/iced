@@ -2,8 +2,8 @@
 //! cheaply re-rendered with [`Transformation`] applied on top of it.
 //!
 //! [`Transformation`]: crate::Transformation
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -35,6 +35,7 @@ pub struct TextureCache {
     id: Id,
     invalidated: Arc<AtomicBool>,
     generation: Arc<AtomicU64>,
+    liveness: Arc<()>,
 }
 
 /// A stable identifier for a [`TextureCache`]. Used by renderers to key their
@@ -59,6 +60,7 @@ impl TextureCache {
             id: Id(NEXT_ID.fetch_add(1, Ordering::Relaxed)),
             invalidated: Arc::new(AtomicBool::new(true)),
             generation: Arc::new(AtomicU64::new(0)),
+            liveness: Arc::new(()),
         }
     }
 
@@ -98,6 +100,19 @@ impl TextureCache {
     /// Returns the current invalidation state without resetting it.
     pub fn is_invalidated(&self) -> bool {
         self.invalidated.load(Ordering::Acquire)
+    }
+
+    /// Returns a [`Weak`] handle that observes when this cache's last live
+    /// handle is dropped.
+    ///
+    /// A renderer stores the returned [`Weak`] next to the backing store it
+    /// keeps for this cache. Once every [`TextureCache`] clone has been
+    /// dropped, [`Weak::upgrade`] returns [`None`], signalling that the backing
+    /// store is now unreachable and it's memry can be reclaimed.
+    ///
+    /// Being a [`Weak`] reference, it never keeps the cache alive iteself.
+    pub fn liveness(&self) -> Weak<()> {
+        Arc::downgrade(&self.liveness)
     }
 }
 

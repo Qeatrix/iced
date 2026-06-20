@@ -69,7 +69,8 @@ use crate::core::{
 use crate::graphics::mesh;
 use crate::graphics::text::{Editor, Paragraph};
 use crate::graphics::{Shell, Viewport};
-use std::sync::Arc;
+use crate::texture_cache::auto_filter_quality;
+use std::sync::{Arc, Weak};
 
 /// A [`wgpu`] graphics renderer for [`iced`].
 ///
@@ -167,6 +168,10 @@ impl Renderer {
         self.triangle.trim();
         self.text.trim();
         self.texture_cache_state.trim();
+
+        self.texture_cache
+            .entries
+            .retain(|_id, entry| entry.liveness.upgrade().is_some());
 
         // TODO: Provide window id (?)
         self.engine.trim();
@@ -312,6 +317,11 @@ impl Renderer {
             Rectangle::<f32>::from(Rectangle::with_size(viewport.physical_size()));
 
         self.layers.merge();
+
+        let texture_filter_quality = self
+            .settings
+            .filter_quality
+            .unwrap_or_else(|| auto_filter_quality(self.engine.device_type));
 
         for layer in self.layers.iter() {
             let clip_bounds = layer.bounds * scale_factor;
@@ -470,6 +480,7 @@ impl Renderer {
                         viewport.projection(),
                         scale_factor,
                         uv_max,
+                        texture_filter_quality,
                     );
                 }
 
@@ -796,6 +807,7 @@ impl Renderer {
         size: Size<u32>,
         physical_size: Size<u32>,
         scale_factor: f32,
+        liveness: Weak<()>,
     ) {
         /// Geometric growth for one axis of the cache texture. Returns the
         /// smallest power-of-two ≥ `needed`, with a 128-px floor, but never
@@ -910,6 +922,7 @@ impl Renderer {
             entry.physical_size = physical_size;
             entry.texture_capacity_size = target_capacity;
             entry.scale_factor = scale_factor;
+            entry.liveness = liveness;
             return;
         }
 
@@ -921,6 +934,8 @@ impl Renderer {
             physical_size,
             texture_capacity_size: target_capacity,
             scale_factor,
+            liveness,
+
             quad: quad::State::new(),
             triangle: triangle::State::new(&self.engine.device, &self.engine.triangle_pipeline),
             text: text::State::new(),
@@ -1189,7 +1204,13 @@ impl core::Renderer for Renderer {
         };
 
         if keep {
-            self.ensure_texture_cache_entry(id, size, physical_size, scale_factor);
+            self.ensure_texture_cache_entry(
+                id,
+                size,
+                physical_size,
+                scale_factor,
+                cache.liveness(),
+            );
         }
 
         let bounds = Rectangle::with_size(Size::new(size.width as f32, size.height as f32));

@@ -1,5 +1,5 @@
 //! Configure your application.
-use crate::renderer;
+use crate::renderer::{self, FilterQuality};
 use crate::{Font, Pixels};
 
 use std::borrow::Cow;
@@ -41,6 +41,16 @@ pub struct Settings {
     ///
     /// By default, it is enabled.
     pub vsync: bool,
+
+    /// The reconstruction filter used when compositing cached widget textures
+    /// under a sub-pixel transform (e.g. during slide animations).
+    ///
+    /// `None` (the default) lets the renderer pick a tier based on the GPU:
+    /// sharpest on discrete GPUs, cheaper on integrated, cheapest on software
+    /// adapters. Set `Some(`[`FilterQuality`]`)` to force one tier everywhere.
+    ///
+    /// [`FilterQuality`]: crate::renderer::FilterQuality
+    pub filter_quality: Option<FilterQuality>,
 }
 
 impl Default for Settings {
@@ -54,6 +64,7 @@ impl Default for Settings {
             default_text_size: renderer.default_text_size,
             antialiasing: true,
             vsync: true,
+            filter_quality: None,
         }
     }
 }
@@ -63,6 +74,7 @@ impl From<&Settings> for renderer::Settings {
         Self {
             default_font: settings.default_font,
             default_text_size: settings.default_text_size,
+            filter_quality: settings.filter_quality,
         }
     }
 }
